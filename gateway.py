@@ -2142,11 +2142,10 @@ async def chat_completions(request: Request):
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {response.status_code}: {error_str[:300]}")
                         await client.aclose()
 
-                        # 处理 429 限流/配额熔断
+                        # 处理 429 限流/配额熔断：针对具体模型开启 60s 冷却，不连坐整个渠道（允许同渠道健康模型如 flash-lite 正常服务）
                         if response.status_code == 429:
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 配额耗尽或限流，开启该模型 180s 快速熔断并在当前请求中跳过 [{p_name}]！")
-                            state.model_cooldowns[model_key] = time.time() + 180.0
-                            failed_providers_in_req.add(p_name)
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 限流/配额不足，开启该模型 60s 快速熔断并转移至下一模型！")
+                            state.model_cooldowns[model_key] = time.time() + 60.0
 
                         # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
                         if response.status_code == 400:
@@ -2391,11 +2390,10 @@ async def chat_completions(request: Request):
                         error_str = resp.text
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {resp.status_code}: {error_str[:300]}")
 
-                        # 处理 429 限流/配额熔断
+                        # 处理 429 限流/配额熔断：针对具体模型开启 60s 冷却，不连坐整个渠道（允许同渠道健康模型如 flash-lite 正常服务）
                         if resp.status_code == 429:
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 配额耗尽或限流，开启该模型 180s 快速熔断并在当前请求中跳过 [{p_name}]！")
-                            state.model_cooldowns[model_key] = time.time() + 180.0
-                            failed_providers_in_req.add(p_name)
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 限流/配额不足，开启该模型 60s 快速熔断并转移至下一模型！")
+                            state.model_cooldowns[model_key] = time.time() + 60.0
 
                         # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
                         if resp.status_code == 400:
