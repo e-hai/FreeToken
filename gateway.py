@@ -146,13 +146,12 @@ def extract_tool_schemas(tools: list) -> dict:
     return schemas
 
 def repair_tool_call_arguments(func_name: str, args_str: str, tool_schemas: dict) -> str:
-    if not func_name or func_name not in tool_schemas or not args_str:
+    if not func_name or not args_str:
         return args_str
-    schema = tool_schemas[func_name]
-    required_fields = schema.get("required", [])
-    properties = schema.get("properties", {})
-    if not required_fields:
-        return args_str
+    
+    schema = tool_schemas.get(func_name) if tool_schemas else None
+    required_fields = schema.get("required", []) if schema else []
+    properties = schema.get("properties", {}) if schema else {}
 
     try:
         args = json.loads(args_str)
@@ -162,40 +161,51 @@ def repair_tool_call_arguments(func_name: str, args_str: str, tool_schemas: dict
         return args_str
 
     modified = False
-    for req in required_fields:
-        if req not in args:
-            # 1. 优先大小写模糊匹配（例如 Description vs description）
-            matched_key = next((k for k in args if k.lower() == req.lower()), None)
-            if matched_key:
-                args[req] = args[matched_key]
-                modified = True
-                continue
 
-            # 2. 智能推断缺失字段的默认合规值
-            prop_def = properties.get(req, {})
-            prop_type = (prop_def.get("type") or "string").lower()
+    # 1. 根据 schema required 严格自愈
+    if required_fields:
+        for req in required_fields:
+            if req not in args:
+                # 优先大小写模糊匹配（例如 Description vs description）
+                matched_key = next((k for k in args if k.lower() == req.lower()), None)
+                if matched_key:
+                    args[req] = args[matched_key]
+                    modified = True
+                    continue
 
-            if "string" in prop_type:
-                if req.lower() in ["description", "desc"]:
-                    args[req] = f"Execute {func_name}"
-                elif req.lower() in ["toolaction", "action"]:
-                    args[req] = "Executing action"
-                elif req.lower() in ["toolsummary", "summary"]:
-                    args[req] = "Tool execution"
-                elif req.lower() in ["cwd", "directory"]:
-                    args[req] = "."
+                # 智能推断缺失字段的默认合规值
+                prop_def = properties.get(req, {})
+                prop_type = (prop_def.get("type") or "string").lower()
+
+                if "string" in prop_type:
+                    if req.lower() in ["description", "desc"]:
+                        cmd_val = str(args.get("command") or args.get("CommandLine") or func_name)[:60]
+                        args[req] = f"Run: {cmd_val}"
+                    elif req.lower() in ["toolaction", "action"]:
+                        args[req] = "Executing action"
+                    elif req.lower() in ["toolsummary", "summary"]:
+                        args[req] = "Tool execution"
+                    elif req.lower() in ["cwd", "directory"]:
+                        args[req] = "."
+                    else:
+                        args[req] = prop_def.get("description", "") or "default"
+                elif "bool" in prop_type:
+                    args[req] = False
+                elif "int" in prop_type or "num" in prop_type:
+                    args[req] = 5000 if ("wait" in req.lower() or "timeout" in req.lower()) else 0
+                elif "array" in prop_type or "list" in prop_type:
+                    args[req] = []
+                elif "object" in prop_type:
+                    args[req] = {}
                 else:
-                    args[req] = prop_def.get("description", "") or "default"
-            elif "bool" in prop_type:
-                args[req] = False
-            elif "int" in prop_type or "num" in prop_type:
-                args[req] = 5000 if ("wait" in req.lower() or "timeout" in req.lower()) else 0
-            elif "array" in prop_type or "list" in prop_type:
-                args[req] = []
-            elif "object" in prop_type:
-                args[req] = {}
-            else:
-                args[req] = "default"
+                    args[req] = "default"
+                modified = True
+
+    # 2. 针对命令执行类工具（bash / run_command / execute_command）普遍要求的 description 顽疾进行双重保底
+    if any(k in func_name.lower() for k in ["command", "bash", "exec", "sh", "terminal"]) or "command" in args or "CommandLine" in args:
+        if "description" not in args and "desc" not in args:
+            cmd_val = str(args.get("command") or args.get("CommandLine") or func_name)[:60]
+            args["description"] = f"Run: {cmd_val}"
             modified = True
 
     if modified:
@@ -2204,10 +2214,20 @@ async def chat_completions(request: Request):
 
                     async def stream_generator():
                         try:
-                            # 模式检测：未配置 tools 时直接走极速通道
-                            is_tc_stream = False if not tool_schemas else None
+                            # 1. 未配置 tools 的纯文本对话：直通极速通道（0 延迟、0 损耗、不截断）
+                            if not tool_schemas:
+                                if first_chunk:
+                                    yield first_chunk
+                                async for chunk in stream_iter:
+                                    yield chunk
+                                return
+
+                            # 2. 配置了 tools 的智能自愈通道：
+                            # 必须持续解析流事件，绝不能因前面有 reasoning_content/content 就锁死直通，
+                            # 否则思考型大模型 (DeepSeek-V4/Nemotron) 的 tool_calls 将被漏过导致缺少 description 报错！
                             buffer = ""
                             tc_active = {}
+                            tc_flushed = False
 
                             async def combined_iter():
                                 if first_chunk:
@@ -2216,24 +2236,6 @@ async def chat_completions(request: Request):
                                     yield c
 
                             async for chunk in combined_iter():
-                                # 1. 纯文本内容流极速直通通道（0 延迟、0 字符损耗、杜绝长文本被截断）
-                                if is_tc_stream is False:
-                                    yield chunk
-                                    continue
-
-                                # 2. 嗅探流类型：若发现纯文本或思考过程，立即锁定为直通模式
-                                if is_tc_stream is None:
-                                    if b'"tool_calls"' in chunk:
-                                        is_tc_stream = True
-                                    elif b'"content"' in chunk or b'"reasoning_content"' in chunk:
-                                        is_tc_stream = False
-                                        yield chunk
-                                        continue
-                                    else:
-                                        yield chunk
-                                        continue
-
-                                # 3. 工具调用专用自愈流
                                 text = chunk.decode("utf-8", errors="ignore")
                                 buffer += text
 
@@ -2254,6 +2256,7 @@ async def chat_completions(request: Request):
                                                     tcs = delta.get("tool_calls")
                                                     finish_reason = choices[0].get("finish_reason")
 
+                                                    # 累积 tool_calls 片段
                                                     if tcs and isinstance(tcs, list):
                                                         event_has_tc = True
                                                         for tc in tcs:
@@ -2267,8 +2270,10 @@ async def chat_completions(request: Request):
                                                             if fn.get("arguments"):
                                                                 entry["args"] += fn["arguments"]
 
-                                                    if finish_reason == "tool_calls" and tc_active:
+                                                    # 当工具调用流结束，立即执行自愈校验并下发完整修复后的参数
+                                                    if (finish_reason in ["tool_calls", "stop"] or finish_reason is not None) and tc_active and not tc_flushed:
                                                         event_has_tc = True
+                                                        tc_flushed = True
                                                         for idx, entry in tc_active.items():
                                                             repaired = repair_tool_call_arguments(entry["name"], entry["args"], tool_schemas)
                                                             repaired_chunk = {
@@ -2296,7 +2301,7 @@ async def chat_completions(request: Request):
                                                             "choices": [{
                                                                 "index": 0,
                                                                 "delta": {},
-                                                                "finish_reason": "tool_calls"
+                                                                "finish_reason": finish_reason or "tool_calls"
                                                             }]
                                                         }
                                                         yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -2304,8 +2309,44 @@ async def chat_completions(request: Request):
                                             except Exception:
                                                 pass
 
+                                    # 非 tool_calls 事件（纯文本 content、reasoning_content 思考过程等）立即流式直出
                                     if not event_has_tc:
                                         yield (event_str + "\n\n").encode("utf-8")
+
+                            # 若流在未收到明确 finish_reason 时意外结束，但存在未刷新的工具调用，予以终极自愈刷新
+                            if tc_active and not tc_flushed:
+                                tc_flushed = True
+                                for idx, entry in tc_active.items():
+                                    repaired = repair_tool_call_arguments(entry["name"], entry["args"], tool_schemas)
+                                    repaired_chunk = {
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [{
+                                                    "index": idx,
+                                                    "id": entry["id"],
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": entry["name"],
+                                                        "arguments": repaired
+                                                    }
+                                                }]
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(repaired_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                finish_chunk = {
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "tool_calls"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                yield b"data: [DONE]\n\n"
 
                             if buffer:
                                 yield buffer.encode("utf-8")
