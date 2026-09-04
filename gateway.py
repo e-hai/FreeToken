@@ -128,6 +128,81 @@ def is_model_vision_capable(model_name: str) -> bool:
         return False
     return any(vk in m_lower for vk in vision_kws)
 
+def extract_tool_schemas(tools: list) -> dict:
+    schemas = {}
+    if not isinstance(tools, list):
+        return schemas
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        func = t.get("function") or t
+        name = func.get("name")
+        params = func.get("parameters") or {}
+        if name and isinstance(params, dict):
+            schemas[name] = {
+                "required": params.get("required", []),
+                "properties": params.get("properties", {})
+            }
+    return schemas
+
+def repair_tool_call_arguments(func_name: str, args_str: str, tool_schemas: dict) -> str:
+    if not func_name or func_name not in tool_schemas or not args_str:
+        return args_str
+    schema = tool_schemas[func_name]
+    required_fields = schema.get("required", [])
+    properties = schema.get("properties", {})
+    if not required_fields:
+        return args_str
+
+    try:
+        args = json.loads(args_str)
+        if not isinstance(args, dict):
+            return args_str
+    except Exception:
+        return args_str
+
+    modified = False
+    for req in required_fields:
+        if req not in args:
+            # 1. 优先大小写模糊匹配（例如 Description vs description）
+            matched_key = next((k for k in args if k.lower() == req.lower()), None)
+            if matched_key:
+                args[req] = args[matched_key]
+                modified = True
+                continue
+
+            # 2. 智能推断缺失字段的默认合规值
+            prop_def = properties.get(req, {})
+            prop_type = (prop_def.get("type") or "string").lower()
+
+            if "string" in prop_type:
+                if req.lower() in ["description", "desc"]:
+                    args[req] = f"Execute {func_name}"
+                elif req.lower() in ["toolaction", "action"]:
+                    args[req] = "Executing action"
+                elif req.lower() in ["toolsummary", "summary"]:
+                    args[req] = "Tool execution"
+                elif req.lower() in ["cwd", "directory"]:
+                    args[req] = "."
+                else:
+                    args[req] = prop_def.get("description", "") or "default"
+            elif "bool" in prop_type:
+                args[req] = False
+            elif "int" in prop_type or "num" in prop_type:
+                args[req] = 5000 if ("wait" in req.lower() or "timeout" in req.lower()) else 0
+            elif "array" in prop_type or "list" in prop_type:
+                args[req] = []
+            elif "object" in prop_type:
+                args[req] = {}
+            else:
+                args[req] = "default"
+            modified = True
+
+    if modified:
+        logger.info(f"🛠️ [工具调用自愈引擎] 补齐模型遗漏必填字段: {func_name} -> {args}")
+        return json.dumps(args, ensure_ascii=False)
+    return args_str
+
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
 def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -> List[Dict[str, Any]]:
     req_clean = requested_model.lower().strip()
@@ -1855,6 +1930,25 @@ async def chat_completions(request: Request):
             prompt_snippet = "[多模态输入]"
 
     forward_body = dict(body)
+    tools = body.get("tools", [])
+    tool_schemas = extract_tool_schemas(tools)
+
+    if tool_schemas:
+        req_params_hint = []
+        for fname, s in tool_schemas.items():
+            reqs = s.get("required") or []
+            if reqs:
+                req_params_hint.append(f"'{fname}' requires: {reqs}")
+        if req_params_hint:
+            hint_str = (
+                "\n[IMPORTANT TOOL CALLING RULE]: When calling ANY tool, you MUST strictly include ALL required parameters "
+                f"defined in its schema: {'; '.join(req_params_hint[:4])}. Never omit required parameters such as 'description', 'CommandLine', etc."
+            )
+            f_msgs = forward_body.get("messages", [])
+            if f_msgs and isinstance(f_msgs, list):
+                if f_msgs[0].get("role") == "system" and isinstance(f_msgs[0].get("content"), str):
+                    f_msgs[0]["content"] += hint_str
+
     # 严格避免 max_tokens 与 max_completion_tokens 同时存在导致大厂（如 Google）报 400 错误
     if "max_completion_tokens" in forward_body:
         forward_body.pop("max_tokens", None)
@@ -2031,8 +2125,90 @@ async def chat_completions(request: Request):
 
                     async def stream_generator():
                         try:
+                            if not tool_schemas:
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                                return
+
+                            buffer = ""
+                            tc_active = {}
+
                             async for chunk in response.aiter_bytes():
-                                yield chunk
+                                text = chunk.decode("utf-8", errors="ignore")
+                                buffer += text
+
+                                while "\n\n" in buffer:
+                                    event_str, buffer = buffer.split("\n\n", 1)
+                                    lines = event_str.split("\n")
+                                    event_has_tc = False
+
+                                    for line in lines:
+                                        line_s = line.strip()
+                                        if line_s.startswith("data: ") and line_s != "data: [DONE]":
+                                            payload = line_s[6:]
+                                            try:
+                                                d = json.loads(payload)
+                                                choices = d.get("choices", [])
+                                                if choices:
+                                                    delta = choices[0].get("delta", {})
+                                                    tcs = delta.get("tool_calls")
+                                                    finish_reason = choices[0].get("finish_reason")
+
+                                                    if tcs and isinstance(tcs, list):
+                                                        event_has_tc = True
+                                                        for tc in tcs:
+                                                            idx = tc.get("index", 0)
+                                                            entry = tc_active.setdefault(idx, {"id": tc.get("id", f"call_{idx}"), "name": "", "args": ""})
+                                                            if tc.get("id"):
+                                                                entry["id"] = tc["id"]
+                                                            fn = tc.get("function", {})
+                                                            if fn.get("name"):
+                                                                entry["name"] = fn["name"]
+                                                            if fn.get("arguments"):
+                                                                entry["args"] += fn["arguments"]
+
+                                                    if finish_reason == "tool_calls" and tc_active:
+                                                        event_has_tc = True
+                                                        for idx, entry in tc_active.items():
+                                                            repaired = repair_tool_call_arguments(entry["name"], entry["args"], tool_schemas)
+                                                            repaired_chunk = {
+                                                                "choices": [{
+                                                                    "index": 0,
+                                                                    "delta": {
+                                                                        "role": "assistant",
+                                                                        "content": None,
+                                                                        "tool_calls": [{
+                                                                            "index": idx,
+                                                                            "id": entry["id"],
+                                                                            "type": "function",
+                                                                            "function": {
+                                                                                "name": entry["name"],
+                                                                                "arguments": repaired
+                                                                            }
+                                                                        }]
+                                                                    },
+                                                                    "finish_reason": None
+                                                                }]
+                                                            }
+                                                            yield f"data: {json.dumps(repaired_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                                        
+                                                        finish_chunk = {
+                                                            "choices": [{
+                                                                "index": 0,
+                                                                "delta": {},
+                                                                "finish_reason": "tool_calls"
+                                                            }]
+                                                        }
+                                                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                                                        continue
+                                            except Exception:
+                                                pass
+
+                                    if not event_has_tc:
+                                        yield (event_str + "\n\n").encode("utf-8")
+
+                            if buffer:
+                                yield buffer.encode("utf-8")
                         except Exception as e:
                             logger.warning(f"Streaming chunk interrupted from [{p_name}]: {e}")
                         finally:
@@ -2086,6 +2262,19 @@ async def chat_completions(request: Request):
 
                     res_json = resp.json()
                     res_json["model"] = requested_model
+
+                    # 工具调用自愈补全
+                    if tool_schemas and "choices" in res_json and isinstance(res_json["choices"], list):
+                        for choice in res_json["choices"]:
+                            msg = choice.get("message", {})
+                            tcs = msg.get("tool_calls", [])
+                            if tcs and isinstance(tcs, list):
+                                for tc in tcs:
+                                    fn = tc.get("function", {})
+                                    fname = fn.get("name", "")
+                                    fargs = fn.get("arguments", "")
+                                    repaired = repair_tool_call_arguments(fname, fargs, tool_schemas)
+                                    fn["arguments"] = repaired
 
                     p_stat["success"] += 1
                     state.stats["success_requests"] += 1
