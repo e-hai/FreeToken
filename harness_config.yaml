@@ -1,0 +1,35 @@
+# ==============================================================================
+# DeepSeek-Harness & LM-Eval 评测任务预设配置文件
+# ==============================================================================
+
+gateway:
+  base_url: "http://127.0.0.1:8000/v1"
+  api_key: "free-token"
+
+# 推荐评测模型映射
+models:
+  primary: "deepseek-v4"      # 默认满血评测 (自动路由至 OpenRouter: DeepSeek-V4 Pro)
+  fast: "qwen3.6"             # 极速常识评测 (自动路由至 Groq: Qwen 3.6 - 700ms)
+  free_pool: "free"           # 免费池测试 (自动路由至 OpenRouter 动态免费池)
+  big_flagship: "gpt-oss-120b" # 超大开源旗舰 (自动路由至 Groq: 120B - 400ms)
+  google: "gemini-flash"      # 超大吞吐评测 (自动路由至 Google AI Studio - 每日1500次)
+
+# 常用评测任务参数推荐
+eval_presets:
+  math_gsm8k:
+    task: "gsm8k"
+    num_fewshot: 5
+    batch_size: 1
+    description: "多步数学逻辑推理能力基准测试"
+
+  knowledge_mmlu:
+    task: "mmlu"
+    num_fewshot: 5
+    batch_size: 1
+    description: "综合跨学科知识理解基准测试"
+
+  code_humaneval:
+    task: "humaneval"
+    num_fewshot: 0
+    batch_size: 1
+    description: "代码生成与编程解题能力基准测试"
