@@ -1941,13 +1941,16 @@ async def chat_completions(request: Request):
                 req_params_hint.append(f"'{fname}' requires: {reqs}")
         if req_params_hint:
             hint_str = (
-                "\n[IMPORTANT TOOL CALLING RULE]: When calling ANY tool, you MUST strictly include ALL required parameters "
-                f"defined in its schema: {'; '.join(req_params_hint[:4])}. Never omit required parameters such as 'description', 'CommandLine', etc."
+                "\n[IMPORTANT TOOL CALLING RULES]:"
+                f"\n1. When calling ANY tool, you MUST strictly include ALL required parameters: {'; '.join(req_params_hint[:4])}. Never omit required parameters such as 'description', 'CommandLine', etc."
+                "\n2. Never overwrite an existing file directly without reading it first. Always call 'view_file' or read tool to inspect existing code before calling 'write_to_file' or 'replace_file_content'."
             )
             f_msgs = forward_body.get("messages", [])
             if f_msgs and isinstance(f_msgs, list):
                 if f_msgs[0].get("role") == "system" and isinstance(f_msgs[0].get("content"), str):
                     f_msgs[0]["content"] += hint_str
+                else:
+                    f_msgs.insert(0, {"role": "system", "content": hint_str.strip()})
 
     # 彻底解除 4096 截断限制：尊重客户端配置，未指定时默认提供 16384 超大输出窗口，支持长代码生成与完整深度思维链
     req_max_tokens = forward_body.get("max_tokens")
