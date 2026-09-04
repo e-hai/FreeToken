@@ -115,16 +115,10 @@ providers:
     upstream_model: adept/fuyu-8b
   - id: jamba-1.5-large-instruct
     upstream_model: ai21labs/jamba-1.5-large-instruct
-  - id: sea-lion-7b-instruct
-    upstream_model: aisingapore/sea-lion-7b-instruct
-  - id: bge-m3
-    upstream_model: baai/bge-m3
-  - id: starcoder2-15b
-    upstream_model: bigcode/starcoder2-15b
-  - id: dbrx-instruct
-    upstream_model: databricks/dbrx-instruct
-  - id: deepseek-coder-6.7b-instruct
-    upstream_model: deepseek-ai/deepseek-coder-6.7b-instruct
+  - id: llama-3.2-11b-vision-instruct
+    upstream_model: meta/llama-3.2-11b-vision-instruct
+  - id: nemotron-3-ultra-550b-a55b
+    upstream_model: nvidia/nemotron-3-ultra-550b-a55b
   - id: deepseek-v4-flash
     upstream_model: deepseek-ai/deepseek-v4-flash-0731
   - id: deepseek-v4-flash-0731

@@ -1420,14 +1420,27 @@ async def api_test_provider(req: TestKeyRequest):
         headers["HTTP-Referer"] = "https://github.com/deepseek-ai/deepseek-harness"
         headers["X-Title"] = "DeepSeek-Harness"
 
-    candidate_models = [m.get("upstream_model") for m in models if m.get("upstream_model")]
+    # 针对不同大厂，优先挑选响应最快、最稳定的探活模型
+    preferred_probes = {
+        "Google AI Studio": ["gemini-3.5-flash", "gemini-flash-latest"],
+        "Groq Cloud": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
+        "NVIDIA NIM": ["meta/llama-3.2-11b-vision-instruct", "nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v4-flash-0731"],
+        "OpenRouter (Global)": ["cohere/north-mini-code:free", "thinkingmachines/inkling-small:free", "openrouter/free"]
+    }
+    p_name = target.get("name", "")
+    candidate_models = list(preferred_probes.get(p_name, []))
+    for m in models:
+        up = m.get("upstream_model")
+        if up and up not in candidate_models:
+            candidate_models.append(up)
+
     if not candidate_models:
-        candidate_models = ["gemini-flash-lite-latest", "deepseek-ai/DeepSeek-V4-Flash", "openrouter/free"]
+        candidate_models = ["gemini-3.5-flash", "meta/llama-3.2-11b-vision-instruct", "openrouter/free"]
 
     start = time.time()
     last_err = ""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for test_model in candidate_models[:6]:
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for test_model in candidate_models[:5]:
             try:
                 resp = await client.post(
                     url,
