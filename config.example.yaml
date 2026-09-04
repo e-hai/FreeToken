@@ -1144,6 +1144,8 @@ fallback_ladders:
     - gemini-3.5-flash
     - gemini-flash-latest
     - nvidia/nemotron-3-ultra-550b-a55b
+    - openai/gpt-oss-120b
+    - qwen/qwen3.8-27b
   - tier: 'Tier 2: LPU 极速芯片与视觉层 (Groq Qwen 3.8 / GPT-OSS 120B / Llama 3.2 视觉)'
     models:
     - openai/gpt-oss-120b

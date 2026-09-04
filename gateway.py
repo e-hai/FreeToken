@@ -246,7 +246,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                 })
         return plan_tiers
 
-    # 2. 当请求 "deepseek-v4-flash"（或指定模型）时，只在支持它的渠道间轮询（大厂优先），绝不跨模型降级！
+    # 2. 当请求 "deepseek-v4-flash"（或指定模型）时，大厂优先轮询目标模型，并追加紧急高可用保活层
     aliases = state.config.get("model_aliases", {})
     alias_target = aliases.get(requested_model, aliases.get(req_clean, requested_model))
     target_keys = {
@@ -258,6 +258,8 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
         target_keys.update([
             "deepseek-ai/deepseek-v4-flash-0731",
             "deepseek-ai/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek-v4-flash-0731",
             "deepseek-v4-flash",
             "deepseek-v4"
         ])
@@ -281,7 +283,12 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
 
     exact_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
     fuzzy_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
-    candidates = exact_candidates if exact_candidates else fuzzy_candidates
+    
+    # 结合精准大厂渠道与备用兼容渠道 (例如 NVIDIA NIM 优先，OpenRouter 兜底)
+    candidates = list(exact_candidates)
+    for c in fuzzy_candidates:
+        if c not in candidates:
+            candidates.append(c)
 
     if not candidates:
         for p in active_providers:
@@ -291,10 +298,36 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                 candidates.append(item)
         candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
 
-    return [{
+    plans = [{
         "tier_name": f"专属渠道轮询: {requested_model}",
         "candidates": candidates
     }]
+
+    # 为保障长流程 Agent (如 30+ 轮自动化编码任务) 绝不因上游单模型瞬时超载崩溃，追加紧急保活兜底层
+    emergency_candidates = []
+    emergency_target_models = [
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.8-27b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "gemini-3.5-flash"
+    ]
+    for target_m in emergency_target_models:
+        t_lower = target_m.lower()
+        for p in active_providers:
+            for m in p.get("models", []):
+                mid = m.get("id", "").lower()
+                up_name = m.get("upstream_model", mid)
+                if t_lower == mid or t_lower == up_name.lower() or t_lower in mid:
+                    item = (p, up_name)
+                    if item not in candidates and item not in emergency_candidates:
+                        emergency_candidates.append(item)
+    if emergency_candidates:
+        emergency_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+        plans.append({
+            "tier_name": f"长流程高可用保活兜底层 (Groq LPU / Nemotron 550B 极速接管)",
+            "candidates": emergency_candidates
+        })
+    return plans
 
 # 1. 深度复刻 Linear.app 官方设计系统控制台（精简双模型版）
 @app.get("/", response_class=HTMLResponse)
@@ -1799,7 +1832,9 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "gemini-3.8-flash",
                     "gemini-3.5-flash",
                     "gemini-flash-latest",
-                    "nvidia/nemotron-3-ultra-550b-a55b"
+                    "nvidia/nemotron-3-ultra-550b-a55b",
+                    "openai/gpt-oss-120b",
+                    "qwen/qwen3.8-27b"
                 ]
             },
             {
@@ -2081,12 +2116,15 @@ async def chat_completions(request: Request):
                     req = client.build_request("POST", url, headers=headers, json=call_body)
                     response = await client.send(req, stream=True)
 
-                    # 若遇到瞬时超载 (529/503)，短暂等待 1.0s 自动重试一次
+                    # 若遇到瞬时超载 (529/503) 或服务不可用，开启 30s 冷却并秒级故障转移至下一候选
                     if response.status_code in [529, 503]:
+                        error_text = await response.aread()
+                        error_str = error_text.decode("utf-8", errors="ignore")
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到瞬时超载 (HTTP {response.status_code})，开启 30s 冷却并秒级转移至下一候选！")
                         await response.aclose()
-                        await asyncio.sleep(1.0)
-                        req = client.build_request("POST", url, headers=headers, json=call_body)
-                        response = await client.send(req, stream=True)
+                        await client.aclose()
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] 服务瞬时超载 (HTTP {response.status_code}): {error_str[:200]}")
 
                     if response.status_code >= 400:
                         error_text = await response.aread()
@@ -2110,6 +2148,29 @@ async def chat_completions(request: Request):
                                 failed_providers_in_req.add(p_name)
 
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
+
+                    # 首包探针：预读取第一块数据，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
+                    stream_iter = response.aiter_bytes()
+                    first_chunk = None
+                    try:
+                        async for chunk in stream_iter:
+                            first_chunk = chunk
+                            break
+                    except Exception as peek_err:
+                        await response.aclose()
+                        await client.aclose()
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
+
+                    # 检查首包是否包含上游超载或报错 (如 NVIDIA/OpenRouter 在 200 SSE 流中推送 error 载荷)
+                    if first_chunk:
+                        chunk_lower = first_chunk.lower()
+                        if (b'"error"' in chunk_lower or b'"detail"' in chunk_lower or b'overload' in chunk_lower) and b'"choices"' not in chunk_lower:
+                            await response.aclose()
+                            await client.aclose()
+                            error_peek_str = first_chunk.decode("utf-8", errors="ignore")
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务超载/报错: {error_peek_str[:200]}，开启 30s 冷却并秒级转移至下一候选渠道！")
+                            state.model_cooldowns[model_key] = time.time() + 30.0
+                            raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包超载: {error_peek_str[:200]}")
 
                     latency = int((time.time() - start_time) * 1000)
                     total_latency = int((time.time() - req_start_time) * 1000)
@@ -2148,7 +2209,13 @@ async def chat_completions(request: Request):
                             buffer = ""
                             tc_active = {}
 
-                            async for chunk in response.aiter_bytes():
+                            async def combined_iter():
+                                if first_chunk:
+                                    yield first_chunk
+                                async for c in stream_iter:
+                                    yield c
+
+                            async for chunk in combined_iter():
                                 # 1. 纯文本内容流极速直通通道（0 延迟、0 字符损耗、杜绝长文本被截断）
                                 if is_tc_stream is False:
                                     yield chunk
@@ -2160,6 +2227,9 @@ async def chat_completions(request: Request):
                                         is_tc_stream = True
                                     elif b'"content"' in chunk or b'"reasoning_content"' in chunk:
                                         is_tc_stream = False
+                                        yield chunk
+                                        continue
+                                    else:
                                         yield chunk
                                         continue
 
@@ -2269,6 +2339,13 @@ async def chat_completions(request: Request):
                     p_stat["last_latency_ms"] = latency
                     await client.aclose()
 
+                    # 瞬时超载 (529/503) 快速避让并故障转移
+                    if resp.status_code in [529, 503] or ("overload" in resp.text.lower()):
+                        error_str = resp.text
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到瞬时超载 (HTTP {resp.status_code})，开启 30s 冷却并秒级故障转移！")
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
+
                     if resp.status_code >= 400:
                         error_str = resp.text
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {resp.status_code}: {error_str[:300]}")
@@ -2291,6 +2368,12 @@ async def chat_completions(request: Request):
                         raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
                     res_json = resp.json()
+                    if "error" in res_json and "choices" not in res_json:
+                        error_str = str(res_json["error"])
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] HTTP 200 响应中包含错误体: {error_str[:200]}，开启 30s 冷却并极速转移！")
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] {error_str}")
+
                     res_json["model"] = requested_model
 
                     # 工具调用自愈补全
