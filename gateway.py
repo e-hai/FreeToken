@@ -2081,219 +2081,170 @@ async def chat_completions(request: Request):
                                 pending_tail = ""
                                 last_chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+                                def build_tool_calls_chunk(tcs, chunk_id):
+                                    return {
+                                        "id": chunk_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": requested_model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": i,
+                                                        "id": tc["id"],
+                                                        "type": "function",
+                                                        "function": tc["function"]
+                                                    }
+                                                    for i, tc in enumerate(tcs)
+                                                ]
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+
+                                def build_finish_chunk(chunk_id, reason="tool_calls"):
+                                    return {
+                                        "id": chunk_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": requested_model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+                                    }
+
+                                def build_content_chunk(chunk_id, text):
+                                    return {
+                                        "id": chunk_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": requested_model,
+                                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                                    }
+
+                                async def process_sse_msg(msg_raw: str):
+                                    nonlocal in_invoke_mode, invoke_buffer, native_tool_calls_seen, pending_tail, last_chunk_id
+                                    lines = [l.strip() for l in msg_raw.split("\n") if l.strip()]
+                                    data_lines = [l[5:].strip() for l in lines if l.startswith("data:")]
+                                    if not data_lines:
+                                        yield f"{msg_raw}\n\n".encode("utf-8")
+                                        return
+
+                                    data_content = "\n".join(data_lines)
+                                    if data_content == "[DONE]":
+                                        if in_invoke_mode and invoke_buffer:
+                                            tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                            if tool_calls:
+                                                logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                                yield f"data: {json.dumps(build_tool_calls_chunk(tool_calls, last_chunk_id))}\n\n".encode("utf-8")
+                                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
+                                            else:
+                                                yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
+                                            invoke_buffer = ""
+                                            in_invoke_mode = False
+                                        elif pending_tail:
+                                            yield f"data: {json.dumps(build_content_chunk(last_chunk_id, pending_tail))}\n\n".encode("utf-8")
+                                            pending_tail = ""
+                                        yield b"data: [DONE]\n\n"
+                                        return
+
+                                    try:
+                                        chunk_json = json.loads(data_content)
+                                    except Exception:
+                                        yield f"data: {data_content}\n\n".encode("utf-8")
+                                        return
+
+                                    if "id" in chunk_json:
+                                        last_chunk_id = chunk_json["id"]
+
+                                    choices = chunk_json.get("choices", [])
+                                    if not choices:
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                        return
+
+                                    delta = choices[0].get("delta", {})
+                                    finish_reason = choices[0].get("finish_reason")
+
+                                    if delta.get("tool_calls") or native_tool_calls_seen:
+                                        native_tool_calls_seen = True
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                        return
+
+                                    if in_invoke_mode:
+                                        content = delta.get("content", "")
+                                        if content:
+                                            invoke_buffer += content
+                                        if finish_reason:
+                                            tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                            if tool_calls:
+                                                logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                                yield f"data: {json.dumps(build_tool_calls_chunk(tool_calls, last_chunk_id))}\n\n".encode("utf-8")
+                                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
+                                                invoke_buffer = ""
+                                                in_invoke_mode = False
+                                                return
+                                            else:
+                                                if invoke_buffer:
+                                                    yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
+                                                    invoke_buffer = ""
+                                                in_invoke_mode = False
+                                                yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                                return
+                                        return
+
+                                    if "content" in delta:
+                                        content = delta["content"] or ""
+                                        if pending_tail:
+                                            content = pending_tail + content
+                                            pending_tail = ""
+
+                                        invoke_tag = None
+                                        for tag in ("<invoke", "<function_call", "<tool_call"):
+                                            if tag in content:
+                                                invoke_tag = tag
+                                                break
+
+                                        if invoke_tag:
+                                            in_invoke_mode = True
+                                            parts = content.split(invoke_tag, 1)
+                                            before_invoke = parts[0]
+                                            invoke_buffer = invoke_tag + parts[1]
+                                            if before_invoke:
+                                                chunk_json["choices"][0]["delta"]["content"] = before_invoke
+                                                yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                            return
+
+                                        if not finish_reason:
+                                            has_prefix = False
+                                            for pfx in sorted(INVOKE_PREFIXES, key=len, reverse=True):
+                                                if content.endswith(pfx):
+                                                    pending_tail = pfx
+                                                    content = content[:-len(pfx)]
+                                                    has_prefix = True
+                                                    break
+                                            if has_prefix:
+                                                if content:
+                                                    chunk_json["choices"][0]["delta"]["content"] = content
+                                                    yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                                return
+
+                                        chunk_json["choices"][0]["delta"]["content"] = content
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                    else:
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+
                                 async for chunk_bytes in response.aiter_bytes():
                                     buffer += chunk_bytes.decode("utf-8", errors="replace")
-                                    lines = buffer.split("\n")
-                                    buffer = lines.pop()
+                                    while "\n\n" in buffer:
+                                        msg_raw, buffer = buffer.split("\n\n", 1)
+                                        msg_raw = msg_raw.strip()
+                                        if msg_raw:
+                                            async for out in process_sse_msg(msg_raw):
+                                                yield out
 
-                                    for line in lines:
-                                        line_str = line.strip()
-                                        if not line_str.startswith("data:"):
-                                            if line_str == "" and not in_invoke_mode:
-                                                yield b"\n"
-                                            continue
-
-                                        data_content = line_str[5:].strip()
-                                        if data_content == "[DONE]":
-                                            if in_invoke_mode and invoke_buffer:
-                                                tool_calls = parse_xml_to_tool_calls(invoke_buffer)
-                                                if tool_calls:
-                                                    logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
-                                                    tc_chunk = {
-                                                        "id": last_chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": requested_model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {
-                                                                "tool_calls": [
-                                                                    {
-                                                                        "index": i,
-                                                                        "id": tc["id"],
-                                                                        "type": "function",
-                                                                        "function": tc["function"]
-                                                                    }
-                                                                    for i, tc in enumerate(tool_calls)
-                                                                ]
-                                                            },
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8")
-                                                    finish_chunk = {
-                                                        "id": last_chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": requested_model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {},
-                                                            "finish_reason": "tool_calls"
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
-                                                    invoke_buffer = ""
-                                                else:
-                                                    tail_chunk = {
-                                                        "id": last_chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": requested_model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": invoke_buffer},
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
-                                                    invoke_buffer = ""
-                                            elif pending_tail:
-                                                tail_chunk = {
-                                                    "id": last_chunk_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": requested_model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": pending_tail},
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
-                                                pending_tail = ""
-                                            yield b"data: [DONE]\n\n"
-                                            continue
-
-                                        try:
-                                            chunk_json = json.loads(data_content)
-                                        except Exception:
-                                            yield f"{line}\n".encode("utf-8")
-                                            continue
-
-                                        if "id" in chunk_json:
-                                            last_chunk_id = chunk_json["id"]
-
-                                        choices = chunk_json.get("choices", [])
-                                        if not choices:
-                                            yield f"{line}\n".encode("utf-8")
-                                            continue
-
-                                        delta = choices[0].get("delta", {})
-                                        finish_reason = choices[0].get("finish_reason")
-
-                                        if delta.get("tool_calls"):
-                                            native_tool_calls_seen = True
-                                            yield f"{line}\n".encode("utf-8")
-                                            continue
-
-                                        if native_tool_calls_seen:
-                                            yield f"{line}\n".encode("utf-8")
-                                            continue
-
-                                        if in_invoke_mode:
-                                            content = delta.get("content", "")
-                                            if content:
-                                                invoke_buffer += content
-                                            if finish_reason:
-                                                tool_calls = parse_xml_to_tool_calls(invoke_buffer)
-                                                if tool_calls:
-                                                    logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
-                                                    tc_chunk = {
-                                                        "id": last_chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": requested_model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {
-                                                                "tool_calls": [
-                                                                    {
-                                                                        "index": i,
-                                                                        "id": tc["id"],
-                                                                        "type": "function",
-                                                                        "function": tc["function"]
-                                                                    }
-                                                                    for i, tc in enumerate(tool_calls)
-                                                                ]
-                                                            },
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8")
-                                                    finish_chunk = {
-                                                        "id": last_chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": requested_model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {},
-                                                            "finish_reason": "tool_calls"
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
-                                                    invoke_buffer = ""
-                                                    continue
-                                                else:
-                                                    if invoke_buffer:
-                                                        tail_chunk = {
-                                                            "id": last_chunk_id,
-                                                            "object": "chat.completion.chunk",
-                                                            "created": int(time.time()),
-                                                            "model": requested_model,
-                                                            "choices": [{
-                                                                "index": 0,
-                                                                "delta": {"content": invoke_buffer},
-                                                                "finish_reason": None
-                                                            }]
-                                                        }
-                                                        yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
-                                                        invoke_buffer = ""
-                                                    yield f"{line}\n".encode("utf-8")
-                                                    continue
-                                            continue
-
-                                        if "content" in delta:
-                                            content = delta["content"] or ""
-                                            if pending_tail:
-                                                content = pending_tail + content
-                                                pending_tail = ""
-
-                                            invoke_tag = None
-                                            for tag in ("<invoke", "<function_call", "<tool_call"):
-                                                if tag in content:
-                                                    invoke_tag = tag
-                                                    break
-
-                                            if invoke_tag:
-                                                in_invoke_mode = True
-                                                parts = content.split(invoke_tag, 1)
-                                                before_invoke = parts[0]
-                                                invoke_buffer = invoke_tag + parts[1]
-                                                if before_invoke:
-                                                    chunk_json["choices"][0]["delta"]["content"] = before_invoke
-                                                    yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
-                                                continue
-
-                                            if not finish_reason:
-                                                has_prefix = False
-                                                for pfx in sorted(INVOKE_PREFIXES, key=len, reverse=True):
-                                                    if content.endswith(pfx):
-                                                        pending_tail = pfx
-                                                        content = content[:-len(pfx)]
-                                                        has_prefix = True
-                                                        break
-                                                if has_prefix:
-                                                    if content:
-                                                        chunk_json["choices"][0]["delta"]["content"] = content
-                                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
-                                                    continue
-
-                                            chunk_json["choices"][0]["delta"]["content"] = content
-                                            yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
-                                        else:
-                                            yield f"{line}\n".encode("utf-8")
+                                if buffer.strip():
+                                    async for out in process_sse_msg(buffer.strip()):
+                                        yield out
 
                         except Exception as e:
                             logger.warning(f"Streaming chunk interrupted from [{p_name}]: {e}")
