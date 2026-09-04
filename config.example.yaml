@@ -1139,6 +1139,7 @@ fallback_ladders:
   auto:
   - tier: 'Tier 1: 大厂满血旗舰层 (Google Gemini 3.8 / 3.5 / NVIDIA 550B · 100万上下文)'
     models:
+    - gemini-3.5-flash-lite
     - gemini-3.8-flash
     - gemini-3.5-flash
     - gemini-flash-latest

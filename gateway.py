@@ -92,6 +92,8 @@ class GatewayState:
         self.request_logs = []
         self.tier_indices = {}
         self.start_time = time.time()
+        self.provider_cooldowns = {}  # {provider_name: expire_time}
+        self.model_cooldowns = {}     # {f"{provider_name}:{model_name}": expire_time}
         self._init_stats()
 
     def _init_stats(self):
@@ -185,18 +187,26 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             "deepseek-v4"
         ])
 
-    candidates = []
+    exact_candidates = []
+    fuzzy_candidates = []
     for p in active_providers:
         for m in p.get("models", []):
             mid = m.get("id", "").lower()
             up_name = m.get("upstream_model", mid)
             up_lower = up_name.lower()
             
-            if (mid in target_keys or up_lower in target_keys or 
-                any(k == mid or k == up_lower or (len(k) > 4 and (k in up_lower or up_lower in k)) for k in target_keys)):
+            if mid in target_keys or up_lower in target_keys:
                 item = (p, up_name)
-                if item not in candidates:
-                    candidates.append(item)
+                if item not in exact_candidates:
+                    exact_candidates.append(item)
+            elif any(k in up_lower or (len(up_lower) > 4 and up_lower in k) for k in target_keys):
+                item = (p, up_name)
+                if item not in fuzzy_candidates and item not in exact_candidates:
+                    fuzzy_candidates.append(item)
+
+    exact_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+    fuzzy_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+    candidates = exact_candidates if exact_candidates else fuzzy_candidates
 
     if not candidates:
         for p in active_providers:
@@ -204,11 +214,10 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             item = (p, up_target)
             if item not in candidates:
                 candidates.append(item)
-
-    candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+        candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
 
     return [{
-        "tier_name": f"DeepSeek-V4-Flash 专属渠道轮询: {requested_model}",
+        "tier_name": f"专属渠道轮询: {requested_model}",
         "candidates": candidates
     }]
 
@@ -1890,6 +1899,7 @@ async def chat_completions(request: Request):
     last_error_detail = None
     total_retries = 0
     attempts_trace = []
+    failed_providers_in_req = set()
 
     for tier_idx, tier_obj in enumerate(tiered_plan, 1):
         tier_name = tier_obj["tier_name"]
@@ -1900,6 +1910,24 @@ async def chat_completions(request: Request):
             base_url = provider.get("base_url", "").rstrip("/")
             api_key = provider.get("api_key", "")
             
+            # 1. 检查当前请求内是否已标记该渠道不可用（如全局429或不支持tool calls）
+            if p_name in failed_providers_in_req:
+                continue
+
+            # 2. 检查单模型是否处于 429 熔断冷却期
+            model_key = f"{p_name}:{upstream_model}"
+            now = time.time()
+            if now < state.model_cooldowns.get(model_key, 0):
+                rem = int(state.model_cooldowns[model_key] - now)
+                logger.info(f"⏳ [{p_name} | {upstream_model}] 正处于 429 熔断冷却中 (剩余 {rem}s)，秒级避让跳过...")
+                continue
+
+            # 3. 检查全渠道是否处于 429 熔断冷却期
+            if now < state.provider_cooldowns.get(p_name, 0):
+                rem = int(state.provider_cooldowns[p_name] - now)
+                logger.info(f"⏳ 渠道 [{p_name}] 正处于全局 429 熔断冷却中 (剩余 {rem}s)，秒级避让跳过...")
+                continue
+
             call_body = dict(forward_body)
             call_body["model"] = upstream_model
 
@@ -1934,16 +1962,17 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=12.0, read=50.0, write=25.0))
+                # 针对慢模型实施快速超时熔断（连接 4s，读取 16s），防止请求长时间卡死
+                client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=4.0, read=16.0, write=10.0, pool=5.0))
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
                     response = await client.send(req, stream=True)
 
-                    # 若遇到瞬时超载 (529/503)，短暂等待 1.5s 自动重试一次
+                    # 若遇到瞬时超载 (529/503)，短暂等待 1.0s 自动重试一次
                     if response.status_code in [529, 503]:
                         await response.aclose()
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.0)
                         req = client.build_request("POST", url, headers=headers, json=call_body)
                         response = await client.send(req, stream=True)
 
@@ -1952,6 +1981,22 @@ async def chat_completions(request: Request):
                         error_str = error_text.decode("utf-8", errors="ignore")
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {response.status_code}: {error_str[:300]}")
                         await client.aclose()
+
+                        # 处理 429 限流/配额熔断
+                        if response.status_code == 429:
+                            if "quota exceeded for metric" in error_str.lower() and upstream_model.lower() in error_str.lower():
+                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 单模型配额耗尽 (429)，开启该模型 120s 快速熔断避让！")
+                                state.model_cooldowns[model_key] = time.time() + 120.0
+                            else:
+                                logger.warning(f"⚠️ [{p_name}] 账号级配料耗尽或限流 (429)，开启渠道 60s 快速熔断避让并在本次请求中跳过！")
+                                state.provider_cooldowns[p_name] = time.time() + 60.0
+                                failed_providers_in_req.add(p_name)
+
+                        # 处理 400 不支持 thought_signature 的 tool_calls 历史
+                        if response.status_code == 400 and ("thought_signature" in error_str or "functioncall" in error_str.lower()):
+                            logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                            failed_providers_in_req.add(p_name)
+
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
                     latency = int((time.time() - start_time) * 1000)
@@ -2019,7 +2064,25 @@ async def chat_completions(request: Request):
                     await client.aclose()
 
                     if resp.status_code >= 400:
-                        raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {resp.text}")
+                        error_str = resp.text
+                        logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {resp.status_code}: {error_str[:300]}")
+
+                        # 处理 429 限流/配额熔断
+                        if resp.status_code == 429:
+                            if "quota exceeded for metric" in error_str.lower() and upstream_model.lower() in error_str.lower():
+                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 单模型配额耗尽 (429)，开启该模型 120s 快速熔断避让！")
+                                state.model_cooldowns[model_key] = time.time() + 120.0
+                            else:
+                                logger.warning(f"⚠️ [{p_name}] 账号级配额耗尽或限流 (429)，开启渠道 60s 快速熔断避让并在本次请求中跳过！")
+                                state.provider_cooldowns[p_name] = time.time() + 60.0
+                                failed_providers_in_req.add(p_name)
+
+                        # 处理 400 不支持 thought_signature 的 tool_calls 历史
+                        if resp.status_code == 400 and ("thought_signature" in error_str or "functioncall" in error_str.lower()):
+                            logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                            failed_providers_in_req.add(p_name)
+
+                        raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
                     res_json = resp.json()
                     res_json["model"] = requested_model
@@ -2065,6 +2128,9 @@ async def chat_completions(request: Request):
             except Exception as e:
                 latency = int((time.time() - start_time) * 1000)
                 error_msg = str(e)
+                if isinstance(e, httpx.TimeoutException):
+                    error_msg = f"Timeout after {latency}ms ({type(e).__name__})"
+                    logger.warning(f"⏱️ [{p_name} | {upstream_model}] 响应超时 ({latency}ms)，立即极速故障转移 (Failover) 至下一候选...")
                 p_stat["errors"] += 1
                 p_stat["last_error"] = error_msg[:120]
                 p_stat["last_latency_ms"] = latency
