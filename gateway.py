@@ -130,14 +130,15 @@ def is_model_vision_capable(model_name: str) -> bool:
         return False
     return any(vk in m_lower for vk in vision_kws)
 
-INVOKE_REGEX = re.compile(r'<invoke\s+name=["\']([^"\']+)["\']\s*>(.*?)</invoke>', re.DOTALL)
-PARAM_REGEX = re.compile(r'<parameter\s+name=["\']([^"\']+)["\']\s*>(.*?)</parameter>', re.DOTALL)
-INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8))
+INVOKE_REGEX = re.compile(r'<(?:invoke|function_call|tool_call)\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</(?:invoke|function_call|tool_call)>|$)', re.DOTALL)
+PARAM_REGEX = re.compile(r'<parameter\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</parameter>|(?=<parameter)|(?=</(?:invoke|function_call|tool_call)>)|$)', re.DOTALL)
+INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8)) + tuple("<function_call"[:i] for i in range(1, 15)) + tuple("<tool_call"[:i] for i in range(1, 11))
 
 def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
     """
-    Parses <invoke name="..."> blocks into standard OpenAI tool_calls structure.
-    Used when DeepSeek-V4 in long context emits Anthropic-style XML invoke blocks instead of structured tool_calls.
+    Parses <invoke name="...">, <function_call name="...">, and <tool_call name="..."> blocks
+    into standard OpenAI tool_calls structure.
+    Used when DeepSeek-V4 in long context emits XML invoke blocks instead of structured tool_calls.
     """
     matches = list(INVOKE_REGEX.finditer(xml_text))
     if not matches:
@@ -148,16 +149,21 @@ def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
         body = match.group(2)
         args = {}
         for p in PARAM_REGEX.finditer(body):
-            args[p.group(1).strip()] = p.group(2)
+            args[p.group(1).strip()] = p.group(2).strip()
         if not args and body.strip():
             raw = body.strip()
             if raw.startswith("{") and raw.endswith("}"):
                 try:
                     args = json.loads(raw)
                 except Exception:
-                    args = {"command": raw}
+                    args = {"command": raw} if tool_name == "bash" else {"input": raw}
             else:
-                args = {"command": raw}
+                args = {"command": raw} if tool_name == "bash" else {"input": raw}
+        elif tool_name == "bash" and "command" not in args:
+            if "content" in args:
+                args["command"] = args["content"]
+            elif "input" in args:
+                args["command"] = args["input"]
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         tool_calls.append({
             "id": call_id,
@@ -174,7 +180,7 @@ def extract_and_convert_xml_tool_calls(text: str):
     Splits out thinking/explanation text and parses XML tool calls.
     Returns: (cleaned_text, tool_calls_list)
     """
-    if not text or "<invoke" not in text:
+    if not text or not any(k in text for k in ("<invoke", "<function_call", "<tool_call")):
         return text, []
     matches = list(INVOKE_REGEX.finditer(text))
     if not matches:
@@ -2128,6 +2134,20 @@ async def chat_completions(request: Request):
                                                     }
                                                     yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
                                                     invoke_buffer = ""
+                                                else:
+                                                    tail_chunk = {
+                                                        "id": last_chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": requested_model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {"content": invoke_buffer},
+                                                            "finish_reason": None
+                                                        }]
+                                                    }
+                                                    yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
+                                                    invoke_buffer = ""
                                             elif pending_tail:
                                                 tail_chunk = {
                                                     "id": last_chunk_id,
@@ -2215,6 +2235,23 @@ async def chat_completions(request: Request):
                                                     yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
                                                     invoke_buffer = ""
                                                     continue
+                                                else:
+                                                    if invoke_buffer:
+                                                        tail_chunk = {
+                                                            "id": last_chunk_id,
+                                                            "object": "chat.completion.chunk",
+                                                            "created": int(time.time()),
+                                                            "model": requested_model,
+                                                            "choices": [{
+                                                                "index": 0,
+                                                                "delta": {"content": invoke_buffer},
+                                                                "finish_reason": None
+                                                            }]
+                                                        }
+                                                        yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
+                                                        invoke_buffer = ""
+                                                    yield f"{line}\n".encode("utf-8")
+                                                    continue
                                             continue
 
                                         if "content" in delta:
@@ -2223,11 +2260,17 @@ async def chat_completions(request: Request):
                                                 content = pending_tail + content
                                                 pending_tail = ""
 
-                                            if "<invoke" in content:
+                                            invoke_tag = None
+                                            for tag in ("<invoke", "<function_call", "<tool_call"):
+                                                if tag in content:
+                                                    invoke_tag = tag
+                                                    break
+
+                                            if invoke_tag:
                                                 in_invoke_mode = True
-                                                parts = content.split("<invoke", 1)
+                                                parts = content.split(invoke_tag, 1)
                                                 before_invoke = parts[0]
-                                                invoke_buffer = "<invoke" + parts[1]
+                                                invoke_buffer = invoke_tag + parts[1]
                                                 if before_invoke:
                                                     chunk_json["choices"][0]["delta"]["content"] = before_invoke
                                                     yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
@@ -2296,7 +2339,7 @@ async def chat_completions(request: Request):
                         if choices:
                             msg = choices[0].get("message", {})
                             content = msg.get("content", "")
-                            if not msg.get("tool_calls") and "<invoke" in (content or ""):
+                            if not msg.get("tool_calls") and any(k in (content or "") for k in ("<invoke", "<function_call", "<tool_call")):
                                 cleaned_text, tool_calls = extract_and_convert_xml_tool_calls(content)
                                 if tool_calls:
                                     logger.info(f"⚡ [Gateway-Rescue] (Non-stream) 成功将 XML 工具调用转换为 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
