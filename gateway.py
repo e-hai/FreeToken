@@ -2001,6 +2001,17 @@ async def chat_completions(request: Request):
     attempts_trace = []
     failed_providers_in_req = set()
 
+    # 智能多轮工具历史嗅探：检测请求历史中是否包含外部多轮 tool_calls / role="tool"
+    # Google AI Studio 的 OpenAI 兼容端要求每条 tool_calls 必须携带其私有 thought_signature，否则必报 HTTP 400
+    if messages and isinstance(messages, list):
+        for msg in messages:
+            if msg.get("role") == "tool" or msg.get("tool_calls"):
+                extra = msg.get("extra_content", {})
+                if not extra or not extra.get("google", {}).get("thought_signature"):
+                    logger.info("⚡ 检测到多轮 Tool Calling 交互历史，自动秒级跳过 Google AI Studio（规避 400 thought_signature 错误），直达 NVIDIA / Groq 标准大厂！")
+                    failed_providers_in_req.add("Google AI Studio")
+                    break
+
     for tier_idx, tier_obj in enumerate(tiered_plan, 1):
         tier_name = tier_obj["tier_name"]
         candidates = tier_obj["candidates"]
@@ -2085,18 +2096,18 @@ async def chat_completions(request: Request):
 
                         # 处理 429 限流/配额熔断
                         if response.status_code == 429:
-                            if "quota exceeded for metric" in error_str.lower() and upstream_model.lower() in error_str.lower():
-                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 单模型配额耗尽 (429)，开启该模型 120s 快速熔断避让！")
-                                state.model_cooldowns[model_key] = time.time() + 120.0
-                            else:
-                                logger.warning(f"⚠️ [{p_name}] 账号级配料耗尽或限流 (429)，开启渠道 60s 快速熔断避让并在本次请求中跳过！")
-                                state.provider_cooldowns[p_name] = time.time() + 60.0
-                                failed_providers_in_req.add(p_name)
-
-                        # 处理 400 不支持 thought_signature 的 tool_calls 历史
-                        if response.status_code == 400 and ("thought_signature" in error_str or "functioncall" in error_str.lower()):
-                            logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 配额耗尽或限流，开启该模型 180s 快速熔断并在当前请求中跳过 [{p_name}]！")
+                            state.model_cooldowns[model_key] = time.time() + 180.0
                             failed_providers_in_req.add(p_name)
+
+                        # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
+                        if response.status_code == 400:
+                            if "thought_signature" in error_str or "functioncall" in error_str.lower():
+                                logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                                failed_providers_in_req.add(p_name)
+                            elif "context" in error_str.lower() or ("token" in error_str.lower() and "length" in error_str.lower()):
+                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 上下文长度超过模型上限，本次请求快速跳过并切往更高上下文大模型！")
+                                failed_providers_in_req.add(p_name)
 
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
@@ -2264,18 +2275,18 @@ async def chat_completions(request: Request):
 
                         # 处理 429 限流/配额熔断
                         if resp.status_code == 429:
-                            if "quota exceeded for metric" in error_str.lower() and upstream_model.lower() in error_str.lower():
-                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 单模型配额耗尽 (429)，开启该模型 120s 快速熔断避让！")
-                                state.model_cooldowns[model_key] = time.time() + 120.0
-                            else:
-                                logger.warning(f"⚠️ [{p_name}] 账号级配额耗尽或限流 (429)，开启渠道 60s 快速熔断避让并在本次请求中跳过！")
-                                state.provider_cooldowns[p_name] = time.time() + 60.0
-                                failed_providers_in_req.add(p_name)
-
-                        # 处理 400 不支持 thought_signature 的 tool_calls 历史
-                        if resp.status_code == 400 and ("thought_signature" in error_str or "functioncall" in error_str.lower()):
-                            logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 配额耗尽或限流，开启该模型 180s 快速熔断并在当前请求中跳过 [{p_name}]！")
+                            state.model_cooldowns[model_key] = time.time() + 180.0
                             failed_providers_in_req.add(p_name)
+
+                        # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
+                        if resp.status_code == 400:
+                            if "thought_signature" in error_str or "functioncall" in error_str.lower():
+                                logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
+                                failed_providers_in_req.add(p_name)
+                            elif "context" in error_str.lower() or ("token" in error_str.lower() and "length" in error_str.lower()):
+                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 上下文长度超过模型上限，本次请求快速跳过并切往更高上下文大模型！")
+                                failed_providers_in_req.add(p_name)
 
                         raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
