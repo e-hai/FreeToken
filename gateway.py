@@ -164,11 +164,15 @@ def build_tiered_execution_plan(requested_model: str) -> List[Dict[str, Any]]:
     target_keys = {
         requested_model.lower(),
         req_clean,
-        str(alias_target).lower(),
-        "deepseek-ai/deepseek-v4-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4"
+        str(alias_target).lower()
     }
+    if "deepseek" in req_clean:
+        target_keys.update([
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "deepseek-ai/deepseek-v4-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4"
+        ])
 
     candidates = []
     for p in active_providers:

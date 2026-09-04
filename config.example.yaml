@@ -265,10 +265,6 @@ providers:
     upstream_model: nvidia/riva-translate-4b-instruct-v2
   - id: vila
     upstream_model: nvidia/vila
-  - id: gpt-oss-120b
-    upstream_model: openai/gpt-oss-120b
-  - id: gpt-oss-20b
-    upstream_model: openai/gpt-oss-20b
   - id: laguna-xs-2.1
     upstream_model: poolside/laguna-xs-2.1
   - id: step-3.7-flash
@@ -381,6 +377,8 @@ providers:
     upstream_model: anthropic/claude-opus-5:batch
   - id: ling-3.0-flash
     upstream_model: inclusionai/ling-3.0-flash
+  - id: ling-3.0-flash-fin:free
+    upstream_model: inclusionai/ling-3.0-flash-fin:free
   - id: laguna-s-2.1
     upstream_model: poolside/laguna-s-2.1
   - id: laguna-s-2.1:free
@@ -1143,22 +1141,28 @@ providers:
   priority: 85
 fallback_ladders:
   auto:
-  - tier: 'Tier 1: 大厂满血旗舰层 (Google Gemini 3.5 / NVIDIA 550B · 100万上下文)'
+  - tier: 'Tier 1: 大厂满血旗舰层 (Google Gemini 3.8 / 3.5 / NVIDIA 550B · 100万上下文)'
     models:
     - gemini-3.8-flash
     - gemini-3.5-flash
     - gemini-flash-latest
     - nvidia/nemotron-3-ultra-550b-a55b
-  - tier: 'Tier 2: LPU 极速芯片层 (Groq Qwen 3.8 / GPT-OSS 120B · 毫秒级响应)'
+  - tier: 'Tier 2: LPU 极速芯片与视觉层 (Groq Qwen 3.8 / GPT-OSS 120B / Llama 3.2 视觉)'
     models:
     - openai/gpt-oss-120b
     - qwen/qwen3.8-27b
-  - tier: 'Tier 3: 专精 Agent 与超长上下文免费层 (Cohere Code / Nemotron 1M)'
+    - groq/compound-mini
+    - meta/llama-3.2-11b-vision-instruct
+  - tier: 'Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Cohere Code / Dots 512K)'
     models:
+    - thinkingmachines/inkling-small:free
+    - thinkingmachines/inkling:free
     - cohere/north-mini-code:free
+    - dots-studio/dots-3-note-preview:free
     - nvidia/nemotron-3.5-lightning:free
+    - minimax/minimax-m3:free
     - gemini-flash-lite-latest
-  - tier: 'Tier 4: 全球高可用动态免费兜底层 (OpenRouter Free 动态智能路由)'
+  - tier: 'Tier 4: 全球高可用动态免费兜底层 (OpenRouter Free 动态智能路由池)'
     models:
     - openrouter/free
 exposed_models:
