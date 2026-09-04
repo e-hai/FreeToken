@@ -118,8 +118,16 @@ class GatewayState:
 
 state = GatewayState()
 
+def is_model_vision_capable(model_name: str) -> bool:
+    m_lower = model_name.lower()
+    vision_kws = ["gemini", "vision", "vl", "omni", "4o", "pixtral", "image", "visual"]
+    non_vision_kws = ["gpt-oss", "qwen3.8", "qwen3.6", "nemotron-3-ultra", "nemotron-3.5", "compound", "north-mini-code", "inkling", "deepseek"]
+    if any(nv in m_lower for nv in non_vision_kws):
+        return False
+    return any(vk in m_lower for vk in vision_kws)
+
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
-def build_tiered_execution_plan(requested_model: str) -> List[Dict[str, Any]]:
+def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -> List[Dict[str, Any]]:
     req_clean = requested_model.lower().strip()
     providers = state.config.get("providers", [])
     active_providers = [
@@ -149,6 +157,9 @@ def build_tiered_execution_plan(requested_model: str) -> List[Dict[str, Any]]:
                             item = (p, up_name)
                             if item not in tier_candidates:
                                 tier_candidates.append(item)
+
+            if has_image:
+                tier_candidates = [item for item in tier_candidates if is_model_vision_capable(item[1])]
 
             if tier_candidates:
                 tier_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
@@ -1856,13 +1867,13 @@ async def chat_completions(request: Request):
             if has_image:
                 break
 
-    # 若包含图像输入且请求模型为纯文本模型 (如 deepseek-v4-flash)，自动无缝调度至顶级免费视觉模型
+    # 若包含图像输入且请求模型为非原生视觉模型，自动无缝调度至顶级多模态视觉模型天梯
     effective_model = requested_model
-    if has_image and ("deepseek" in requested_model.lower() or requested_model.lower() == "deepseek-v4-flash"):
-        logger.info(f"👁️ 【多模态视觉智能协同】检测到图像输入！[{requested_model}] 无原生视觉感知能力，已自动无缝切换至顶级视觉模型 [Google Gemini 3.5 Flash] 协同完成任务...")
+    if has_image and not is_model_vision_capable(requested_model):
+        logger.info(f"👁️ 【多模态视觉智能协同】检测到图像输入！[{requested_model}] 无原生视觉感知能力，已自动无缝切换至多模态视觉天梯 (Google Gemini 3.8 / 3.5 / Llama 3.2 Vision)...")
         effective_model = "auto"
 
-    tiered_plan = build_tiered_execution_plan(effective_model)
+    tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image)
     if not tiered_plan:
         state.stats["failed_requests"] += 1
         return JSONResponse(
