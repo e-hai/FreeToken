@@ -104,7 +104,6 @@ providers:
     upstream_model: gemini-3.5-live-translate-preview
   - id: lyria-realtime-exp
     upstream_model: lyria-realtime-exp
-  checkin_url: https://aistudio.google.com
   priority: 100
 - name: NVIDIA NIM
   category: 全球大厂
@@ -279,7 +278,6 @@ providers:
     upstream_model: writer/palmyra-med-70b-32k
   - id: zamba2-7b-instruct
     upstream_model: zyphra/zamba2-7b-instruct
-  checkin_url: https://build.nvidia.com
   priority: 95
 - name: Groq Cloud
   category: 极速芯片
@@ -308,7 +306,6 @@ providers:
     upstream_model: qwen/qwen3.8-27b
   - id: compound-mini
     upstream_model: groq/compound-mini
-  checkin_url: https://console.groq.com/keys
   priority: 90
 - name: OpenRouter (Global)
   category: 全球聚合
@@ -1137,7 +1134,6 @@ providers:
     upstream_model: openai/gpt-3.5-turbo:batch
   - id: gpt-4
     upstream_model: openai/gpt-4
-  checkin_url: https://openrouter.ai/keys
   priority: 85
 fallback_ladders:
   auto:

@@ -952,7 +952,6 @@ async def dashboard():
                                 <th>Models</th>
                                 <th style="width:90px;">Calls</th>
                                 <th style="width:170px;">Ping Test</th>
-                                <th style="width:70px;">Checkin</th>
                                 <th style="width:50px;">Action</th>
                             </tr>
                         </thead>
@@ -1028,7 +1027,7 @@ async def dashboard():
                 tbody.innerHTML = "";
 
                 if (list.length === 0) {{
-                    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-tertiary);padding:24px;">No matching providers found</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-tertiary);padding:24px;">No matching providers found</td></tr>`;
                     return;
                 }}
 
@@ -1042,8 +1041,6 @@ async def dashboard():
                     const rankBadge = isBigTech 
                         ? `<span class="badge-priority" style="font-size:9.5px;padding:1px 5px;">👑 优先 (P:${{p.priority || 50}})</span>` 
                         : `<span class="badge" style="font-size:9.5px;color:var(--text-tertiary);">P:${{p.priority || 50}}</span>`;
-
-                    const checkinLink = p.checkin_url ? `<a href="${{p.checkin_url}}" target="_blank" style="color:var(--linear-brand);text-decoration:none;font-weight:500;font-size:11px;display:inline-flex;align-items:center;gap:3px;">签到 <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></span></a>` : "-";
 
                     const tr = document.createElement("tr");
                     tr.innerHTML = `
@@ -1086,7 +1083,6 @@ async def dashboard():
                             </button>
                             <span id="test-res-${{p.name}}" style="margin-left:6px;font-size:11px;"></span>
                         </td>
-                        <td>${{checkinLink}}</td>
                         <td>
                             <button class="btn btn-danger" style="padding:4px 6px;" onclick="deleteProvider('${{p.name}}')" title="删除此渠道">
                                 <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></span>
