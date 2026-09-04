@@ -1949,13 +1949,16 @@ async def chat_completions(request: Request):
                 if f_msgs[0].get("role") == "system" and isinstance(f_msgs[0].get("content"), str):
                     f_msgs[0]["content"] += hint_str
 
-    # 严格避免 max_tokens 与 max_completion_tokens 同时存在导致大厂（如 Google）报 400 错误
-    if "max_completion_tokens" in forward_body:
-        forward_body.pop("max_tokens", None)
-    else:
-        req_max_tokens = forward_body.get("max_tokens")
-        if req_max_tokens is None or (isinstance(req_max_tokens, int) and req_max_tokens > 4096):
-            forward_body["max_tokens"] = 4096
+    # 彻底解除 4096 截断限制：尊重客户端配置，未指定时默认提供 16384 超大输出窗口，支持长代码生成与完整深度思维链
+    req_max_tokens = forward_body.get("max_tokens")
+    req_max_comp = forward_body.get("max_completion_tokens")
+    if req_max_tokens is None and req_max_comp is None:
+        forward_body["max_tokens"] = 16384
+    elif req_max_comp is not None and req_max_tokens is None:
+        forward_body["max_tokens"] = req_max_comp
+        forward_body.pop("max_completion_tokens", None)
+    elif req_max_comp is not None and req_max_tokens is not None:
+        forward_body.pop("max_completion_tokens", None)
 
     # 智能多模态视觉嗅探：检测请求中是否包含图像输入 (image_url)
     has_image = False
@@ -2056,8 +2059,9 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                # 针对慢模型实施快速超时熔断（连接 4s，读取 16s），防止请求长时间卡死
-                client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=4.0, read=16.0, write=10.0, pool=5.0))
+                # 建连阶段保持 4.0s 极速故障转移，读取阶段给予 120s 充裕窗口，防止大模型长文本/长思维链生成被截断
+                client_timeout = httpx.Timeout(120.0, connect=4.0, read=120.0, write=15.0, pool=5.0)
+                client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
@@ -2125,15 +2129,27 @@ async def chat_completions(request: Request):
 
                     async def stream_generator():
                         try:
-                            if not tool_schemas:
-                                async for chunk in response.aiter_bytes():
-                                    yield chunk
-                                return
-
+                            # 模式检测：未配置 tools 时直接走极速通道
+                            is_tc_stream = False if not tool_schemas else None
                             buffer = ""
                             tc_active = {}
 
                             async for chunk in response.aiter_bytes():
+                                # 1. 纯文本内容流极速直通通道（0 延迟、0 字符损耗、杜绝长文本被截断）
+                                if is_tc_stream is False:
+                                    yield chunk
+                                    continue
+
+                                # 2. 嗅探流类型：若发现纯文本或思考过程，立即锁定为直通模式
+                                if is_tc_stream is None:
+                                    if b'"tool_calls"' in chunk:
+                                        is_tc_stream = True
+                                    elif b'"content"' in chunk or b'"reasoning_content"' in chunk:
+                                        is_tc_stream = False
+                                        yield chunk
+                                        continue
+
+                                # 3. 工具调用专用自愈流
                                 text = chunk.decode("utf-8", errors="ignore")
                                 buffer += text
 
