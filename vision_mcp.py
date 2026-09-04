@@ -48,31 +48,41 @@ def analyze_image(image_path: str, prompt: str = "请详细描述此图片中的
         "max_tokens": 2048
     }
 
-    try:
-        req = urllib.request.Request(
-            GATEWAY_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=60.0) as resp:
-            resp_body = resp.read().decode("utf-8")
-            data = json.loads(resp_body)
-            choice = data["choices"][0]["message"]
-            content = choice.get("content")
-            if content and content.strip():
-                return content.strip()
-            reasoning = choice.get("reasoning")
-            if reasoning and reasoning.strip():
-                return reasoning.strip()
-            return "视觉分析完成，但视觉模型未返回具体文字描述。"
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8")
-        return f"❌ 视觉大模型请求失败 (HTTP {e.code}): {err_msg[:300]}"
-    except Exception as e:
-        return f"❌ 视觉请求出现异常: {str(e)}"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "Connection": "close"
+    }
+
+    last_err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                GATEWAY_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers
+            )
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                resp_body = resp.read().decode("utf-8")
+                data = json.loads(resp_body)
+                choice = data["choices"][0]["message"]
+                content = choice.get("content")
+                if content and content.strip():
+                    return content.strip()
+                reasoning = choice.get("reasoning")
+                if reasoning and reasoning.strip():
+                    return reasoning.strip()
+                return "视觉分析完成，但视觉模型未返回具体文字描述。"
+        except urllib.error.HTTPError as e:
+            err_msg = e.read().decode("utf-8")
+            return f"❌ 视觉大模型请求失败 (HTTP {e.code}): {err_msg[:300]}"
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                import time
+                time.sleep(1.0)
+                continue
+            return f"❌ 视觉请求出现异常: {str(last_err)}"
 
 def run_mcp_server():
     """以标准 JSON-RPC 2.0 stdio 模式运行 MCP 服务"""
