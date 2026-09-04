@@ -2044,18 +2044,6 @@ async def chat_completions(request: Request):
     last_error_detail = None
     total_retries = 0
     attempts_trace = []
-    failed_providers_in_req = set()
-
-    # 智能多轮工具历史嗅探：检测请求历史中是否包含外部多轮 tool_calls / role="tool"
-    # Google AI Studio 的 OpenAI 兼容端要求每条 tool_calls 必须携带其私有 thought_signature，否则必报 HTTP 400
-    if messages and isinstance(messages, list):
-        for msg in messages:
-            if msg.get("role") == "tool" or msg.get("tool_calls"):
-                extra = msg.get("extra_content", {})
-                if not extra or not extra.get("google", {}).get("thought_signature"):
-                    logger.info("⚡ 检测到多轮 Tool Calling 交互历史，自动秒级跳过 Google AI Studio（规避 400 thought_signature 错误），直达 NVIDIA / Groq 标准大厂！")
-                    failed_providers_in_req.add("Google AI Studio")
-                    break
 
     for tier_idx, tier_obj in enumerate(tiered_plan, 1):
         tier_name = tier_obj["tier_name"]
@@ -2065,24 +2053,6 @@ async def chat_completions(request: Request):
             p_name = provider.get("name", "Unknown")
             base_url = provider.get("base_url", "").rstrip("/")
             api_key = provider.get("api_key", "")
-            
-            # 1. 检查当前请求内是否已标记该渠道不可用（如全局429或不支持tool calls）
-            if p_name in failed_providers_in_req:
-                continue
-
-            # 2. 检查单模型是否处于 429 熔断冷却期
-            model_key = f"{p_name}:{upstream_model}"
-            now = time.time()
-            if now < state.model_cooldowns.get(model_key, 0):
-                rem = int(state.model_cooldowns[model_key] - now)
-                logger.info(f"⏳ [{p_name} | {upstream_model}] 正处于 429 熔断冷却中 (剩余 {rem}s)，秒级避让跳过...")
-                continue
-
-            # 3. 检查全渠道是否处于 429 熔断冷却期
-            if now < state.provider_cooldowns.get(p_name, 0):
-                rem = int(state.provider_cooldowns[p_name] - now)
-                logger.info(f"⏳ 渠道 [{p_name}] 正处于全局 429 熔断冷却中 (剩余 {rem}s)，秒级避让跳过...")
-                continue
 
             call_body = dict(forward_body)
             call_body["model"] = upstream_model
@@ -2118,44 +2088,20 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                # 建连阶段保持 4.0s 极速故障转移，读取阶段给予 120s 充裕窗口，防止大模型长文本/长思维链生成被截断
-                client_timeout = httpx.Timeout(120.0, connect=4.0, read=120.0, write=15.0, pool=5.0)
+                # 充裕的建连与读取超时窗口，防止大模型长文本/长思维链生成被截断
+                client_timeout = httpx.Timeout(180.0, connect=15.0, read=180.0, write=30.0, pool=10.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
                     response = await client.send(req, stream=True)
 
-                    # 若遇到瞬时超载 (529/503) 或服务不可用，开启 30s 冷却并秒级故障转移至下一候选
-                    if response.status_code in [529, 503]:
-                        error_text = await response.aread()
-                        error_str = error_text.decode("utf-8", errors="ignore")
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到瞬时超载 (HTTP {response.status_code})，开启 30s 冷却并秒级转移至下一候选！")
-                        await response.aclose()
-                        await client.aclose()
-                        state.model_cooldowns[model_key] = time.time() + 30.0
-                        raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] 服务瞬时超载 (HTTP {response.status_code}): {error_str[:200]}")
-
                     if response.status_code >= 400:
                         error_text = await response.aread()
                         error_str = error_text.decode("utf-8", errors="ignore")
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {response.status_code}: {error_str[:300]}")
+                        await response.aclose()
                         await client.aclose()
-
-                        # 处理 429 限流/配额熔断：针对具体模型开启 60s 冷却，不连坐整个渠道（允许同渠道健康模型如 flash-lite 正常服务）
-                        if response.status_code == 429:
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 限流/配额不足，开启该模型 60s 快速熔断并转移至下一模型！")
-                            state.model_cooldowns[model_key] = time.time() + 60.0
-
-                        # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
-                        if response.status_code == 400:
-                            if "thought_signature" in error_str or "functioncall" in error_str.lower():
-                                logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
-                                failed_providers_in_req.add(p_name)
-                            elif "context" in error_str.lower() or ("token" in error_str.lower() and "length" in error_str.lower()):
-                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 上下文长度超过模型上限，本次请求快速跳过并切往更高上下文大模型！")
-                                failed_providers_in_req.add(p_name)
-
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
                     # 首包探针：预读取第一块数据，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
@@ -2170,16 +2116,15 @@ async def chat_completions(request: Request):
                         await client.aclose()
                         raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
 
-                    # 检查首包是否包含上游超载或报错 (如 NVIDIA/OpenRouter 在 200 SSE 流中推送 error 载荷)
+                    # 检查首包是否包含上游超载或报错 (如在 200 SSE 流中推送 error 载荷)
                     if first_chunk:
                         chunk_lower = first_chunk.lower()
                         if (b'"error"' in chunk_lower or b'"detail"' in chunk_lower or b'overload' in chunk_lower) and b'"choices"' not in chunk_lower:
                             await response.aclose()
                             await client.aclose()
                             error_peek_str = first_chunk.decode("utf-8", errors="ignore")
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务超载/报错: {error_peek_str[:200]}，开启 30s 冷却并秒级转移至下一候选渠道！")
-                            state.model_cooldowns[model_key] = time.time() + 30.0
-                            raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包超载: {error_peek_str[:200]}")
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务报错: {error_peek_str[:200]}，故障转移至下一候选渠道...")
+                            raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包报错: {error_peek_str[:200]}")
 
                     latency = int((time.time() - start_time) * 1000)
                     total_latency = int((time.time() - req_start_time) * 1000)
@@ -2379,38 +2324,15 @@ async def chat_completions(request: Request):
                     p_stat["last_latency_ms"] = latency
                     await client.aclose()
 
-                    # 瞬时超载 (529/503) 快速避让并故障转移
-                    if resp.status_code in [529, 503] or ("overload" in resp.text.lower()):
-                        error_str = resp.text
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到瞬时超载 (HTTP {resp.status_code})，开启 30s 冷却并秒级故障转移！")
-                        state.model_cooldowns[model_key] = time.time() + 30.0
-                        raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
-
                     if resp.status_code >= 400:
                         error_str = resp.text
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {resp.status_code}: {error_str[:300]}")
-
-                        # 处理 429 限流/配额熔断：针对具体模型开启 60s 冷却，不连坐整个渠道（允许同渠道健康模型如 flash-lite 正常服务）
-                        if resp.status_code == 429:
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 触发 429 限流/配额不足，开启该模型 60s 快速熔断并转移至下一模型！")
-                            state.model_cooldowns[model_key] = time.time() + 60.0
-
-                        # 处理 400 不支持 thought_signature 的 tool_calls 历史或上下文超长
-                        if resp.status_code == 400:
-                            if "thought_signature" in error_str or "functioncall" in error_str.lower():
-                                logger.warning(f"⚠️ [{p_name}] 缺少 thought_signature 拒绝处理历史 tool_calls，本次请求快速跳过该渠道并转移至标准兼容模型！")
-                                failed_providers_in_req.add(p_name)
-                            elif "context" in error_str.lower() or ("token" in error_str.lower() and "length" in error_str.lower()):
-                                logger.warning(f"⚠️ [{p_name} | {upstream_model}] 上下文长度超过模型上限，本次请求快速跳过并切往更高上下文大模型！")
-                                failed_providers_in_req.add(p_name)
-
                         raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
                     res_json = resp.json()
                     if "error" in res_json and "choices" not in res_json:
                         error_str = str(res_json["error"])
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] HTTP 200 响应中包含错误体: {error_str[:200]}，开启 30s 冷却并极速转移！")
-                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] HTTP 200 响应中包含错误体: {error_str[:200]}，转移至下一候选...")
                         raise HTTPException(status_code=503, detail=f"[{p_name}] {error_str}")
 
                     res_json["model"] = requested_model
