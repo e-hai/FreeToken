@@ -5,6 +5,8 @@ import shutil
 import logging
 import asyncio
 import urllib.parse
+import re
+import uuid
 from typing import Dict, List, Any, Optional
 import yaml
 import httpx
@@ -127,6 +129,60 @@ def is_model_vision_capable(model_name: str) -> bool:
     if any(nv in m_lower for nv in non_vision_kws):
         return False
     return any(vk in m_lower for vk in vision_kws)
+
+INVOKE_REGEX = re.compile(r'<invoke\s+name=["\']([^"\']+)["\']\s*>(.*?)</invoke>', re.DOTALL)
+PARAM_REGEX = re.compile(r'<parameter\s+name=["\']([^"\']+)["\']\s*>(.*?)</parameter>', re.DOTALL)
+INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8))
+
+def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
+    """
+    Parses <invoke name="..."> blocks into standard OpenAI tool_calls structure.
+    Used when DeepSeek-V4 in long context emits Anthropic-style XML invoke blocks instead of structured tool_calls.
+    """
+    matches = list(INVOKE_REGEX.finditer(xml_text))
+    if not matches:
+        return []
+    tool_calls = []
+    for match in matches:
+        tool_name = match.group(1).strip()
+        body = match.group(2)
+        args = {}
+        for p in PARAM_REGEX.finditer(body):
+            args[p.group(1).strip()] = p.group(2)
+        if not args and body.strip():
+            raw = body.strip()
+            if raw.startswith("{") and raw.endswith("}"):
+                try:
+                    args = json.loads(raw)
+                except Exception:
+                    args = {"command": raw}
+            else:
+                args = {"command": raw}
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
+        tool_calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(args, ensure_ascii=False)
+            }
+        })
+    return tool_calls
+
+def extract_and_convert_xml_tool_calls(text: str):
+    """
+    Splits out thinking/explanation text and parses XML tool calls.
+    Returns: (cleaned_text, tool_calls_list)
+    """
+    if not text or "<invoke" not in text:
+        return text, []
+    matches = list(INVOKE_REGEX.finditer(text))
+    if not matches:
+        return text, []
+    first_start = matches[0].start()
+    cleaned_text = text[:first_start].strip()
+    tool_calls = parse_xml_to_tool_calls(text)
+    return cleaned_text, tool_calls
 
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
 def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -> List[Dict[str, Any]]:
@@ -2004,10 +2060,198 @@ async def chat_completions(request: Request):
                     }
                     state.add_log(log_entry)
 
+                    has_tools = bool(call_body.get("tools"))
+
                     async def stream_generator():
                         try:
-                            async for chunk in response.aiter_bytes():
-                                yield chunk
+                            if not has_tools:
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                            else:
+                                buffer = ""
+                                in_invoke_mode = False
+                                invoke_buffer = ""
+                                native_tool_calls_seen = False
+                                pending_tail = ""
+                                last_chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+                                async for chunk_bytes in response.aiter_bytes():
+                                    buffer += chunk_bytes.decode("utf-8", errors="replace")
+                                    lines = buffer.split("\n")
+                                    buffer = lines.pop()
+
+                                    for line in lines:
+                                        line_str = line.strip()
+                                        if not line_str.startswith("data:"):
+                                            if line_str == "" and not in_invoke_mode:
+                                                yield b"\n"
+                                            continue
+
+                                        data_content = line_str[5:].strip()
+                                        if data_content == "[DONE]":
+                                            if in_invoke_mode and invoke_buffer:
+                                                tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                                if tool_calls:
+                                                    logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                                    tc_chunk = {
+                                                        "id": last_chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": requested_model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "tool_calls": [
+                                                                    {
+                                                                        "index": i,
+                                                                        "id": tc["id"],
+                                                                        "type": "function",
+                                                                        "function": tc["function"]
+                                                                    }
+                                                                    for i, tc in enumerate(tool_calls)
+                                                                ]
+                                                            },
+                                                            "finish_reason": None
+                                                        }]
+                                                    }
+                                                    yield f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8")
+                                                    finish_chunk = {
+                                                        "id": last_chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": requested_model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {},
+                                                            "finish_reason": "tool_calls"
+                                                        }]
+                                                    }
+                                                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                                                    invoke_buffer = ""
+                                            elif pending_tail:
+                                                tail_chunk = {
+                                                    "id": last_chunk_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": requested_model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": pending_tail},
+                                                        "finish_reason": None
+                                                    }]
+                                                }
+                                                yield f"data: {json.dumps(tail_chunk)}\n\n".encode("utf-8")
+                                                pending_tail = ""
+                                            yield b"data: [DONE]\n\n"
+                                            continue
+
+                                        try:
+                                            chunk_json = json.loads(data_content)
+                                        except Exception:
+                                            yield f"{line}\n".encode("utf-8")
+                                            continue
+
+                                        if "id" in chunk_json:
+                                            last_chunk_id = chunk_json["id"]
+
+                                        choices = chunk_json.get("choices", [])
+                                        if not choices:
+                                            yield f"{line}\n".encode("utf-8")
+                                            continue
+
+                                        delta = choices[0].get("delta", {})
+                                        finish_reason = choices[0].get("finish_reason")
+
+                                        if delta.get("tool_calls"):
+                                            native_tool_calls_seen = True
+                                            yield f"{line}\n".encode("utf-8")
+                                            continue
+
+                                        if native_tool_calls_seen:
+                                            yield f"{line}\n".encode("utf-8")
+                                            continue
+
+                                        if in_invoke_mode:
+                                            content = delta.get("content", "")
+                                            if content:
+                                                invoke_buffer += content
+                                            if finish_reason:
+                                                tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                                if tool_calls:
+                                                    logger.info(f"⚡ [Gateway-Rescue] 成功从长任务流式输出中提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                                    tc_chunk = {
+                                                        "id": last_chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": requested_model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "tool_calls": [
+                                                                    {
+                                                                        "index": i,
+                                                                        "id": tc["id"],
+                                                                        "type": "function",
+                                                                        "function": tc["function"]
+                                                                    }
+                                                                    for i, tc in enumerate(tool_calls)
+                                                                ]
+                                                            },
+                                                            "finish_reason": None
+                                                        }]
+                                                    }
+                                                    yield f"data: {json.dumps(tc_chunk)}\n\n".encode("utf-8")
+                                                    finish_chunk = {
+                                                        "id": last_chunk_id,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": requested_model,
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {},
+                                                            "finish_reason": "tool_calls"
+                                                        }]
+                                                    }
+                                                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                                                    invoke_buffer = ""
+                                                    continue
+                                            continue
+
+                                        if "content" in delta:
+                                            content = delta["content"] or ""
+                                            if pending_tail:
+                                                content = pending_tail + content
+                                                pending_tail = ""
+
+                                            if "<invoke" in content:
+                                                in_invoke_mode = True
+                                                parts = content.split("<invoke", 1)
+                                                before_invoke = parts[0]
+                                                invoke_buffer = "<invoke" + parts[1]
+                                                if before_invoke:
+                                                    chunk_json["choices"][0]["delta"]["content"] = before_invoke
+                                                    yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                                continue
+
+                                            if not finish_reason:
+                                                has_prefix = False
+                                                for pfx in sorted(INVOKE_PREFIXES, key=len, reverse=True):
+                                                    if content.endswith(pfx):
+                                                        pending_tail = pfx
+                                                        content = content[:-len(pfx)]
+                                                        has_prefix = True
+                                                        break
+                                                if has_prefix:
+                                                    if content:
+                                                        chunk_json["choices"][0]["delta"]["content"] = content
+                                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                                    continue
+
+                                            chunk_json["choices"][0]["delta"]["content"] = content
+                                            yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
+                                        else:
+                                            yield f"{line}\n".encode("utf-8")
+
                         except Exception as e:
                             logger.warning(f"Streaming chunk interrupted from [{p_name}]: {e}")
                         finally:
@@ -2032,6 +2276,7 @@ async def chat_completions(request: Request):
                         }
                     )
                 else:
+                    has_tools = bool(call_body.get("tools"))
                     resp = await client.post(url, headers=headers, json=call_body)
                     latency = int((time.time() - start_time) * 1000)
                     total_latency = int((time.time() - req_start_time) * 1000)
@@ -2045,6 +2290,19 @@ async def chat_completions(request: Request):
 
                     res_json = resp.json()
                     res_json["model"] = requested_model
+
+                    if has_tools:
+                        choices = res_json.get("choices", [])
+                        if choices:
+                            msg = choices[0].get("message", {})
+                            content = msg.get("content", "")
+                            if not msg.get("tool_calls") and "<invoke" in (content or ""):
+                                cleaned_text, tool_calls = extract_and_convert_xml_tool_calls(content)
+                                if tool_calls:
+                                    logger.info(f"⚡ [Gateway-Rescue] (Non-stream) 成功将 XML 工具调用转换为 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                    msg["content"] = cleaned_text or None
+                                    msg["tool_calls"] = tool_calls
+                                    choices[0]["finish_reason"] = "tool_calls"
 
                     p_stat["success"] += 1
                     state.stats["success_requests"] += 1
