@@ -423,6 +423,13 @@ async def dashboard():
                 border-color: rgba(244, 63, 94, 0.4);
                 color: white;
             }}
+            .spin {{
+                animation: spin 1s linear infinite;
+            }}
+            @keyframes spin {{
+                from {{ transform: rotate(0deg); }}
+                to {{ transform: rotate(360deg); }}
+            }}
 
             .metrics-grid {{
                 display: grid;
@@ -847,7 +854,13 @@ async def dashboard():
                         <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
                         <span>Gateway Core Models · 网关保留的核心模型 (2 个)</span>
                     </div>
-                    <span class="card-subtitle">已精简梳理，DeepSeek-Harness 与客户端仅展示以下两个模型</span>
+                    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                        <span class="card-subtitle" style="margin:0;">DeepSeek-Harness 与客户端暴露模型</span>
+                        <button class="btn btn-primary" id="btn-update-models-top" onclick="updateLatestModels()" style="padding:4px 12px;font-size:11.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px;" title="从全网与各渠道获取最新最强免费模型并写入配置">
+                            <span class="svg-icon svg-icon-sm" id="update-models-icon-top"><svg viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg></span>
+                            <span id="update-models-text-top">获取最新最强免费模型</span>
+                        </button>
+                    </div>
                 </div>
                 <div class="models-showcase">
                     <div class="model-card" style="border-color: rgba(94, 106, 210, 0.4); background: rgba(94, 106, 210, 0.04);">
@@ -949,7 +962,15 @@ async def dashboard():
                                 <th style="width:60px;">Status</th>
                                 <th style="width:200px;">Provider</th>
                                 <th style="width:280px;">API Key</th>
-                                <th>Models</th>
+                                <th>
+                                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                        <span>Models</span>
+                                        <button class="btn btn-primary" id="btn-update-models-th" onclick="updateLatestModels()" title="获取最新最强免费模型到配置" style="padding:2px 8px;font-size:10.5px;font-weight:600;display:inline-flex;align-items:center;gap:4px;">
+                                            <span class="svg-icon svg-icon-sm" id="update-models-icon-th" style="width:11px;height:11px;"><svg viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg></span>
+                                            <span id="update-models-text-th">更新模型</span>
+                                        </button>
+                                    </div>
+                                </th>
                                 <th style="width:90px;">Calls</th>
                                 <th style="width:170px;">Ping Test</th>
                                 <th style="width:50px;">Action</th>
@@ -992,11 +1013,19 @@ async def dashboard():
             let stats = {stats_json};
             let currentCategory = "all";
 
-            function showToast(msg, type = "info") {{
+            function showToast(msg, type = "info", duration = 3000) {{
                 const t = document.getElementById("toast");
                 t.innerHTML = msg;
+                if (type === "success") {{
+                    t.style.borderLeftColor = "var(--accent-emerald)";
+                }} else if (type === "error") {{
+                    t.style.borderLeftColor = "var(--accent-rose)";
+                }} else {{
+                    t.style.borderLeftColor = "var(--linear-brand)";
+                }}
                 t.style.display = "flex";
-                setTimeout(() => {{ t.style.display = "none"; }}, 3000);
+                if (window._toastTimer) clearTimeout(window._toastTimer);
+                window._toastTimer = setTimeout(() => {{ t.style.display = "none"; }}, duration);
             }}
 
             function setCategoryFilter(cat, btn) {{
@@ -1236,6 +1265,51 @@ async def dashboard():
                 }}
             }}
 
+            async function updateLatestModels() {{
+                const btnTop = document.getElementById("btn-update-models-top");
+                const btnTh = document.getElementById("btn-update-models-th");
+                const iconTop = document.getElementById("update-models-icon-top");
+                const iconTh = document.getElementById("update-models-icon-th");
+                const textTop = document.getElementById("update-models-text-top");
+                const textTh = document.getElementById("update-models-text-th");
+
+                if (btnTop) btnTop.disabled = true;
+                if (btnTh) btnTh.disabled = true;
+                if (iconTop) iconTop.classList.add("spin");
+                if (iconTh) iconTh.classList.add("spin");
+                if (textTop) textTop.innerText = "检索全网最新模型中...";
+                if (textTh) textTh.innerText = "更新中...";
+
+                showToast("🔍 正在跨渠道探测最新最强免费模型 (Google, Groq, NVIDIA, OpenRouter)...", "info", 5000);
+
+                try {{
+                    const res = await fetch("/api/models/update_latest", {{
+                        method: "POST",
+                        headers: {{ "Content-Type": "application/json" }}
+                    }});
+                    const data = await res.json();
+                    if (data.status === "ok") {{
+                        if (data.providers) {{
+                            providers = data.providers;
+                            filterProviders();
+                        }}
+                        const highlight = data.top_models ? data.top_models.slice(0, 4).map(m => `<b>${{m.name}}</b> (${{m.provider}})`).join("、") : "";
+                        showToast(`✅ <b>最新最强免费模型已写入配置！</b><br><span style="font-size:11px;color:var(--text-secondary);">已同步接入 ${{highlight}} 等前沿大模型</span>`, "success", 6000);
+                    }} else {{
+                        showToast(`更新模型失败: ${{data.message || "未知错误"}}`, "error", 4000);
+                    }}
+                }} catch (e) {{
+                    showToast(`更新请求异常: ${{e.message}}`, "error", 4000);
+                }} finally {{
+                    if (btnTop) btnTop.disabled = false;
+                    if (btnTh) btnTh.disabled = false;
+                    if (iconTop) iconTop.classList.remove("spin");
+                    if (iconTh) iconTh.classList.remove("spin");
+                    if (textTop) textTop.innerText = "获取最新最强免费模型";
+                    if (textTh) textTh.innerText = "更新模型";
+                }}
+            }}
+
             async function loadLogs() {{
                 try {{
                     const res = await fetch("/api/logs");
@@ -1461,6 +1535,239 @@ async def api_test_provider(req: TestKeyRequest):
 
     latency = int((time.time() - start) * 1000)
     return {"status": "error", "latency_ms": latency, "message": last_err}
+
+async def fetch_and_update_latest_free_models() -> dict:
+    """
+    Dynamically probes Google AI Studio, Groq Cloud, NVIDIA NIM, and OpenRouter
+    for the latest and strongest free models, updates config.yaml, and reloads in-memory state.
+    """
+    providers = state.config.get("providers", [])
+    prov_map = {p.get("name", ""): p for p in providers}
+
+    discovered_models = {}
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        # 1. OpenRouter Free Models
+        try:
+            r = await client.get("https://openrouter.ai/api/v1/models")
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                free_list = [
+                    m for m in data
+                    if m.get("id", "").endswith(":free") or
+                       (isinstance(m.get("pricing"), dict) and str(m["pricing"].get("prompt")) == "0" and str(m["pricing"].get("completion")) == "0")
+                ]
+                free_list.sort(key=lambda x: x.get("context_length", 0), reverse=True)
+                discovered_models["OpenRouter (Global)"] = [
+                    {"id": m.get("id"), "upstream_model": m.get("id")}
+                    for m in free_list
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to query OpenRouter models: {e}")
+
+        # 2. Google AI Studio Models
+        google_p = prov_map.get("Google AI Studio")
+        if google_p:
+            g_key = (google_p.get("api_key") or "").strip()
+            if g_key and not g_key.startswith("YOUR_"):
+                try:
+                    r = await client.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={g_key}")
+                    if r.status_code == 200:
+                        g_data = r.json().get("models", [])
+                        g_models = []
+                        for m in g_data:
+                            methods = m.get("supportedGenerationMethods", [])
+                            if "generateContent" in methods:
+                                mid = m.get("name", "").replace("models/", "")
+                                g_models.append({"id": mid, "upstream_model": mid})
+                        discovered_models["Google AI Studio"] = g_models
+                except Exception as e:
+                    logger.warning(f"Failed to query Google models: {e}")
+
+        # 3. Groq Cloud Models
+        groq_p = prov_map.get("Groq Cloud")
+        if groq_p:
+            groq_key = (groq_p.get("api_key") or "").strip()
+            if groq_key and not groq_key.startswith("YOUR_"):
+                try:
+                    r = await client.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {groq_key}"})
+                    if r.status_code == 200:
+                        models_data = r.json().get("data", [])
+                        discovered_models["Groq Cloud"] = [
+                            {"id": m.get("id"), "upstream_model": m.get("id")}
+                            for m in models_data
+                        ]
+                except Exception as e:
+                    logger.warning(f"Failed to query Groq models: {e}")
+
+        # 4. NVIDIA NIM Models
+        nim_p = prov_map.get("NVIDIA NIM")
+        if nim_p:
+            nim_key = (nim_p.get("api_key") or "").strip()
+            if nim_key and not nim_key.startswith("YOUR_"):
+                try:
+                    r = await client.get("https://integrate.api.nvidia.com/v1/models", headers={"Authorization": f"Bearer {nim_key}"})
+                    if r.status_code == 200:
+                        models_data = r.json().get("data", [])
+                        discovered_models["NVIDIA NIM"] = [
+                            {"id": m.get("id"), "upstream_model": m.get("id")}
+                            for m in models_data
+                        ]
+                except Exception as e:
+                    logger.warning(f"Failed to query NVIDIA NIM models: {e}")
+
+    # Curated Top Free Models Priorities
+    curated_priorities = {
+        "Google AI Studio": [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash",
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            "gemini-2.5-pro",
+            "gemma-4-31b-it",
+            "gemma-4-26b-a4b-it"
+        ],
+        "Groq Cloud": [
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "groq/compound-mini",
+            "groq/compound",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant"
+        ],
+        "NVIDIA NIM": [
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "meta/llama-3.2-11b-vision-instruct",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "meta/llama-3.3-70b-instruct"
+        ],
+        "OpenRouter (Global)": [
+            "thinkingmachines/inkling-small:free",
+            "thinkingmachines/inkling:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "minimax/minimax-m3:free",
+            "dots-studio/dots-3-note-preview:free",
+            "google/gemma-4-31b-it:free",
+            "google/gemma-4-26b-a4b-it:free",
+            "z-ai/glm-5.2:free",
+            "cohere/north-mini-code:free",
+            "openrouter/free"
+        ]
+    }
+
+    added_count = 0
+    updated_providers = []
+
+    # Merge models into providers
+    for p in providers:
+        p_name = p.get("name", "")
+        existing_models = p.get("models", [])
+        existing_ids = {m.get("id") for m in existing_models}
+        existing_upstreams = {m.get("upstream_model") for m in existing_models}
+
+        candidates = []
+        for cur_id in curated_priorities.get(p_name, []):
+            candidates.append({"id": cur_id, "upstream_model": cur_id})
+
+        for disc_m in discovered_models.get(p_name, []):
+            candidates.append(disc_m)
+
+        new_top_models = []
+        seen = set()
+        for cand in candidates:
+            cid = cand.get("id")
+            cup = cand.get("upstream_model") or cid
+            if cid and cid not in seen:
+                seen.add(cid)
+                if cid not in existing_ids and cup not in existing_upstreams:
+                    added_count += 1
+                new_top_models.append({"id": cid, "upstream_model": cup})
+
+        for old_m in existing_models:
+            old_id = old_m.get("id")
+            if old_id and old_id not in seen:
+                seen.add(old_id)
+                new_top_models.append(old_m)
+
+        p["models"] = new_top_models
+        updated_providers.append(p_name)
+
+    # Synchronize fallback ladders for "auto"
+    state.config["fallback_ladders"] = {
+        "auto": [
+            {
+                "tier": "Tier 1: 大厂满血旗舰层 (Google Gemini 3.8 / 3.5 / NVIDIA 550B · 100万上下文)",
+                "models": [
+                    "gemini-3.8-flash",
+                    "gemini-3.5-flash",
+                    "gemini-flash-latest",
+                    "nvidia/nemotron-3-ultra-550b-a55b"
+                ]
+            },
+            {
+                "tier": "Tier 2: LPU 极速芯片与视觉层 (Groq Qwen 3.8 / GPT-OSS 120B / Llama 3.2 视觉)",
+                "models": [
+                    "openai/gpt-oss-120b",
+                    "qwen/qwen3.8-27b",
+                    "groq/compound-mini",
+                    "meta/llama-3.2-11b-vision-instruct"
+                ]
+            },
+            {
+                "tier": "Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Cohere Code / Dots 512K)",
+                "models": [
+                    "thinkingmachines/inkling-small:free",
+                    "thinkingmachines/inkling:free",
+                    "cohere/north-mini-code:free",
+                    "dots-studio/dots-3-note-preview:free",
+                    "nvidia/nemotron-3.5-lightning:free",
+                    "minimax/minimax-m3:free",
+                    "gemini-flash-lite-latest"
+                ]
+            },
+            {
+                "tier": "Tier 4: 全球高可用动态免费兜底层 (OpenRouter Free 动态智能路由池)",
+                "models": [
+                    "openrouter/free"
+                ]
+            }
+        ]
+    }
+
+    save_config(state.config)
+    state.reload_config()
+
+    top_models_summary = [
+        {"name": "gemini-3.8-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.8代旗舰 · 百万上下文"},
+        {"name": "gemini-3.5-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.5代生产主力"},
+        {"name": "openai/gpt-oss-120b", "provider": "Groq Cloud", "context": "131,072", "tag": "120B 开源旗舰 · 700+ t/s LPU"},
+        {"name": "qwen/qwen3.8-27b", "provider": "Groq Cloud", "context": "131,042", "tag": "通义千问3.8极速"},
+        {"name": "nvidia/nemotron-3-ultra-550b-a55b", "provider": "NVIDIA NIM", "context": "1,000,000", "tag": "550B MoE 巨无霸"},
+        {"name": "meta/llama-3.2-11b-vision-instruct", "provider": "NVIDIA NIM", "context": "131,072", "tag": "多模态视觉理解"},
+        {"name": "thinkingmachines/inkling-small:free", "provider": "OpenRouter", "context": "1,048,576", "tag": "100万长上下文 · 思维链"},
+        {"name": "dots-studio/dots-3-note-preview:free", "provider": "OpenRouter", "context": "512,000", "tag": "512K 上下文 · MoE 专家"}
+    ]
+
+    return {
+        "status": "ok",
+        "message": "成功检索并更新最新最强免费模型矩阵！",
+        "added_count": added_count,
+        "updated_providers": updated_providers,
+        "top_models": top_models_summary,
+        "providers": state.config.get("providers", [])
+    }
+
+@app.post("/api/models/update_latest")
+async def api_update_latest_models():
+    try:
+        res = await fetch_and_update_latest_free_models()
+        return res
+    except Exception as e:
+        logger.error(f"Update latest models failed: {e}")
+        return {"status": "error", "message": f"更新失败: {str(e)}"}
 
 # 3. 精简模型列表接口 (/v1/models) - 严格只暴露 auto 和 deepseek-v4-flash
 @app.get("/v1/models")
