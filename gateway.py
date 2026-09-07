@@ -2021,7 +2021,8 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                client_timeout = httpx.Timeout(180.0, connect=15.0, read=180.0, write=30.0, pool=10.0)
+                p_timeout = float(provider.get("timeout", 40.0 if is_stream else 50.0))
+                client_timeout = httpx.Timeout(p_timeout, connect=10.0, read=p_timeout, write=30.0, pool=10.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
@@ -2283,6 +2284,11 @@ async def chat_completions(request: Request):
                         raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
                     res_json = resp.json()
+                    if isinstance(res_json, dict) and "error" in res_json and not res_json.get("choices"):
+                        error_str = str(res_json["error"])
+                        logger.warning(f"❌ [{p_name} | {upstream_model}] 200 payload error: {error_str[:300]}")
+                        raise HTTPException(status_code=502, detail=f"[{p_name}] {error_str}")
+
                     res_json["model"] = requested_model
 
                     if has_tools:
