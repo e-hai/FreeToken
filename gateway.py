@@ -2002,6 +2002,11 @@ async def chat_completions(request: Request):
             call_body = dict(forward_body)
             call_body["model"] = upstream_model
 
+            # 过滤非标准端点不支持的参数 (例如 Google 端点不认识 store 导致 400)
+            if "google" in base_url.lower() or "generativelanguage" in base_url.lower():
+                call_body.pop("store", None)
+                call_body.pop("metadata", None)
+
             url = f"{base_url}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -2011,6 +2016,9 @@ async def chat_completions(request: Request):
             if "openrouter" in base_url.lower():
                 headers["HTTP-Referer"] = "https://github.com/deepseek-ai/deepseek-harness"
                 headers["X-Title"] = "DeepSeek-Harness"
+                # 防止超长上下文叠加超大 max_tokens (如 32768) 触发 OpenRouter 402 预估额度拦截
+                if call_body.get("max_tokens", 0) > 4096:
+                    call_body["max_tokens"] = 4096
 
             p_stat = state.stats["provider_stats"].setdefault(p_name, {
                 "calls": 0, "success": 0, "errors": 0, "last_error": "", "last_latency_ms": 0, "status": "Active"
