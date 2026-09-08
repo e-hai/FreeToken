@@ -198,7 +198,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
         p for p in providers 
         if p.get("enabled") and p.get("api_key") and not p.get("api_key", "").startswith("YOUR_")
     ]
-    # 按大厂优先级权重排序 (Google 100 > NVIDIA 95 > Groq 90 > OpenRouter 85 > 中转 40)
+    # 按大厂优先级权重排序 (NVIDIA 100 > Google 95 > Groq 90 > OpenRouter 85 > 中转 40)
     active_providers.sort(key=lambda p: p.get("priority", 50), reverse=True)
 
     # 1. 当请求 "auto" 时，执行跨大厂多级降级天梯
@@ -1049,7 +1049,7 @@ async def dashboard():
                     </div>
                     <span class="card-subtitle">
                         <span class="svg-icon svg-icon-sm" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg></span>
-                        大厂优先置顶（Google 100 > NVIDIA 95 > Groq 90 > OpenRouter 85）
+                        大厂优先置顶（NVIDIA 100 > Google 95 > Groq 90 > OpenRouter 85）
                     </span>
                 </div>
 
@@ -1177,8 +1177,9 @@ async def dashboard():
 
                 list.forEach((p) => {{
                     const pStat = stats.provider_stats[p.name] || {{ calls: 0, success: 0, errors: 0, last_latency_ms: 0 }};
-                    const modelsHtml = (p.models || []).slice(0, 4).map(m => `<span class="badge badge-model">${{m.id}}</span>`).join(" ");
-                    const moreBadge = (p.models && p.models.length > 4) ? `<span class="badge badge-model" style="color:var(--linear-brand);">+${{p.models.length - 4}}</span>` : "";
+                    const allModelIds = (p.models || []).map(m => m.id).join(", ");
+                    const modelsHtml = (p.models || []).slice(0, 5).map(m => `<span class="badge badge-model" title="${{m.id}}">${{m.id}}</span>`).join(" ");
+                    const moreBadge = (p.models && p.models.length > 5) ? `<span class="badge badge-model" style="color:var(--linear-brand);cursor:help;" title="${{allModelIds}}">+${{p.models.length - 5}}</span>` : "";
                     const categoryBadge = p.category ? `<span class="badge">${{p.category}}</span>` : "";
                     
                     const isBigTech = (p.priority || 0) >= 90;
@@ -1731,8 +1732,25 @@ async def fetch_and_update_latest_free_models() -> dict:
                 except Exception as e:
                     logger.warning(f"Failed to query NVIDIA NIM models: {e}")
 
-    # Curated Top Free Models Priorities
+    # Curated Top Free Models Priorities (最强模型置顶排在最前)
     curated_priorities = {
+        "NVIDIA NIM": [
+            "moonshotai/kimi-k3",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "meta/llama-3.2-11b-vision-instruct",
+            "minimaxai/minimax-m3",
+            "google/diffusiongemma-26b-a4b-it",
+            "poolside/laguna-xs-2.1",
+            "openai/gpt-oss-20b",
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-coder-6.7b-instruct",
+            "mistralai/codestral-22b-instruct-v0.1",
+            "01-ai/yi-large"
+        ],
         "Google AI Studio": [
             "gemini-3.8-flash",
             "gemini-3.7-flash",
@@ -1751,33 +1769,19 @@ async def fetch_and_update_latest_free_models() -> dict:
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant"
         ],
-        "NVIDIA NIM": [
-            "moonshotai/kimi-k3",
-            "nvidia/nemotron-3-ultra-550b-a55b",
-            "nvidia/nemotron-3-super-120b-a12b",
-            "nvidia/nemotron-3.5-lightning-30b-a3b",
-            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-            "meta/llama-3.2-11b-vision-instruct",
-            "minimaxai/minimax-m3",
-            "google/diffusiongemma-26b-a4b-it",
-            "poolside/laguna-xs-2.1",
-            "openai/gpt-oss-20b",
-            "deepseek-ai/deepseek-v4-flash-0731",
-            "deepseek-ai/deepseek-v4-pro-0813",
-            "deepseek-ai/deepseek-coder-6.7b-instruct",
-            "mistralai/codestral-22b-instruct-v0.1",
-            "01-ai/yi-large"
-        ],
         "OpenRouter (Global)": [
             "thinkingmachines/inkling-small:free",
             "thinkingmachines/inkling:free",
-            "nvidia/nemotron-3.5-lightning:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "minimax/minimax-m3:free",
+            "nvidia/nemotron-3.5-lightning:free",
             "dots-studio/dots-3-note-preview:free",
+            "minimax/minimax-m3:free",
             "google/gemma-4-31b-it:free",
             "google/gemma-4-26b-a4b-it:free",
-            "z-ai/glm-5.2:free",
+            "inclusionai/ling-3.0-flash-fin:free",
+            "inclusionai/ling-3.0-flash-sante:free",
+            "poolside/laguna-s-2.1:free",
+            "poolside/laguna-xs-2.1:free",
             "cohere/north-mini-code:free",
             "openrouter/free"
         ]
@@ -1820,16 +1824,16 @@ async def fetch_and_update_latest_free_models() -> dict:
         p["models"] = new_top_models
         updated_providers.append(p_name)
 
-    # Synchronize fallback ladders for "auto"
+    # Synchronize fallback ladders for "auto" (确保顶级旗舰排在首位)
     state.config["fallback_ladders"] = {
         "auto": [
             {
-                "tier": "Tier 1: 大厂满血旗舰层 (Google Gemini 3.8 / 3.5 / NVIDIA 550B · 100万上下文)",
+                "tier": "Tier 1: 大厂满血旗舰层 (NVIDIA Kimi K3 / Google Gemini 3.8 / 3.5 · 100万上下文)",
                 "models": [
+                    "moonshotai/kimi-k3",
                     "gemini-3.8-flash",
                     "gemini-3.5-flash",
                     "gemini-flash-latest",
-                    "moonshotai/kimi-k3",
                     "nvidia/nemotron-3-ultra-550b-a55b",
                     "nvidia/nemotron-3-super-120b-a12b",
                     "openai/gpt-oss-120b",
@@ -1874,14 +1878,14 @@ async def fetch_and_update_latest_free_models() -> dict:
     state.reload_config()
 
     top_models_summary = [
+        {"name": "moonshotai/kimi-k3", "provider": "NVIDIA NIM", "context": "262,144", "tag": "Kimi K3 推理旗舰 · NVIDIA 独家满血首发"},
         {"name": "gemini-3.8-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.8代旗舰 · 百万上下文"},
         {"name": "gemini-3.5-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.5代生产主力"},
         {"name": "openai/gpt-oss-120b", "provider": "Groq Cloud", "context": "131,072", "tag": "120B 开源旗舰 · 700+ t/s LPU"},
         {"name": "qwen/qwen3.8-27b", "provider": "Groq Cloud", "context": "131,042", "tag": "通义千问3.8极速"},
         {"name": "nvidia/nemotron-3-ultra-550b-a55b", "provider": "NVIDIA NIM", "context": "1,000,000", "tag": "550B MoE 巨无霸"},
         {"name": "meta/llama-3.2-11b-vision-instruct", "provider": "NVIDIA NIM", "context": "131,072", "tag": "多模态视觉理解"},
-        {"name": "thinkingmachines/inkling-small:free", "provider": "OpenRouter", "context": "1,048,576", "tag": "100万长上下文 · 思维链"},
-        {"name": "dots-studio/dots-3-note-preview:free", "provider": "OpenRouter", "context": "512,000", "tag": "512K 上下文 · MoE 专家"}
+        {"name": "thinkingmachines/inkling-small:free", "provider": "OpenRouter", "context": "1,048,576", "tag": "100万长上下文 · 思维链"}
     ]
 
     return {
@@ -2010,8 +2014,29 @@ async def chat_completions(request: Request):
         tier_name = tier_obj["tier_name"]
         candidates = tier_obj["candidates"]
 
+        now_ts = time.time()
+        # 清理已过期的模型熔断冷却
+        state.model_cooldowns = {k: v for k, v in state.model_cooldowns.items() if v > now_ts}
+
         for provider, upstream_model in candidates:
             p_name = provider.get("name", "Unknown")
+            model_key = f"{p_name}:{upstream_model}"
+
+            # 熔断冷却拦截：若模型在过去 30 秒内发生过 429 限流或 503 超载，且当前梯队还有其它候选，则跳过
+            cooldown_until = state.model_cooldowns.get(model_key, 0)
+            if now_ts < cooldown_until:
+                has_active_alternative = any(
+                    now_ts >= state.model_cooldowns.get(f"{p.get('name')}:{m}", 0)
+                    for p, m in candidates if f"{p.get('name')}:{m}" != model_key
+                )
+                if has_active_alternative:
+                    remain_secs = int(cooldown_until - now_ts)
+                    logger.info(f"⏳ [{p_name} | {upstream_model}] 处于熔断冷却中 (剩余 {remain_secs}s)，快速绕行至同梯队其它可用候选...")
+                    continue
+                else:
+                    logger.info(f"⚡ [{p_name} | {upstream_model}] 处于冷却中但为梯队最后底线，解除冷却尝试调用...")
+                    state.model_cooldowns.pop(model_key, None)
+
             base_url = provider.get("base_url", "").rstrip("/")
             api_key = provider.get("api_key", "")
 
@@ -2053,13 +2078,49 @@ async def chat_completions(request: Request):
                     req = client.build_request("POST", url, headers=headers, json=call_body)
                     response = await client.send(req, stream=True)
 
+                    # 若遇到瞬时超载 (529/503) 或限流 (429)，开启 30s 冷却并秒级故障转移至下一候选
+                    if response.status_code in [429, 503, 529]:
+                        error_text = await response.aread()
+                        error_str = error_text.decode("utf-8", errors="ignore")
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到限流/超载 (HTTP {response.status_code})，开启 30s 冷却并秒级转移至下一候选！")
+                        await response.aclose()
+                        await client.aclose()
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] 服务瞬时限流/超载 (HTTP {response.status_code}): {error_str[:200]}")
+
                     if response.status_code >= 400:
                         error_text = await response.aread()
                         error_str = error_text.decode("utf-8", errors="ignore")
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {response.status_code}: {error_str[:300]}")
                         await response.aclose()
                         await client.aclose()
+                        model_key = f"{p_name}:{upstream_model}"
+                        state.model_cooldowns[model_key] = time.time() + 30.0
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
+
+                    # 🌟 首包探针：预读取第一块数据，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
+                    stream_iter = response.aiter_bytes()
+                    first_chunk = None
+                    try:
+                        async for chunk in stream_iter:
+                            first_chunk = chunk
+                            break
+                    except Exception as peek_err:
+                        await response.aclose()
+                        await client.aclose()
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
+
+                    # 检查首包是否包含上游超载或报错 (如 NVIDIA/OpenRouter 在 200 SSE 流中推送 error 载荷)
+                    if first_chunk:
+                        chunk_lower = first_chunk.lower()
+                        if (b'"error"' in chunk_lower or b'"detail"' in chunk_lower or b'overload' in chunk_lower) and b'"choices"' not in chunk_lower:
+                            await response.aclose()
+                            await client.aclose()
+                            error_peek_str = first_chunk.decode("utf-8", errors="ignore")
+                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务超载/报错: {error_peek_str[:200]}，开启 30s 冷却并秒级转移至下一候选渠道！")
+                            model_key = f"{p_name}:{upstream_model}"
+                            state.model_cooldowns[model_key] = time.time() + 30.0
+                            raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包超载: {error_peek_str[:200]}")
 
                     latency = int((time.time() - start_time) * 1000)
                     total_latency = int((time.time() - req_start_time) * 1000)
@@ -2093,10 +2154,16 @@ async def chat_completions(request: Request):
 
                     has_tools = bool(call_body.get("tools"))
 
+                    async def combined_bytes_iter():
+                        if first_chunk:
+                            yield first_chunk
+                        async for c in stream_iter:
+                            yield c
+
                     async def stream_generator():
                         try:
                             if not has_tools:
-                                async for chunk in response.aiter_bytes():
+                                async for chunk in combined_bytes_iter():
                                     yield chunk
                             else:
                                 buffer = ""
@@ -2258,7 +2325,7 @@ async def chat_completions(request: Request):
                                     else:
                                         yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
 
-                                async for chunk_bytes in response.aiter_bytes():
+                                async for chunk_bytes in combined_bytes_iter():
                                     buffer += chunk_bytes.decode("utf-8", errors="replace")
                                     while "\n\n" in buffer:
                                         msg_raw, buffer = buffer.split("\n\n", 1)
@@ -2302,14 +2369,24 @@ async def chat_completions(request: Request):
                     p_stat["last_latency_ms"] = latency
                     await client.aclose()
 
+                    model_key = f"{p_name}:{upstream_model}"
+
+                    if resp.status_code in [429, 503, 529] or "overload" in resp.text.lower():
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        error_str = resp.text
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 瞬时超载/限流 (HTTP {resp.status_code}): {error_str[:200]}，开启 30s 冷却并秒级转移至下一候选...")
+                        raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
+
                     if resp.status_code >= 400:
                         error_str = resp.text
+                        state.model_cooldowns[model_key] = time.time() + 30.0
                         logger.warning(f"❌ [{p_name} | {upstream_model}] HTTP {resp.status_code}: {error_str[:300]}")
                         raise HTTPException(status_code=resp.status_code, detail=f"[{p_name}] {error_str}")
 
                     res_json = resp.json()
-                    if isinstance(res_json, dict) and "error" in res_json and not res_json.get("choices"):
-                        error_str = str(res_json["error"])
+                    if isinstance(res_json, dict) and ("error" in res_json or "detail" in res_json) and not res_json.get("choices"):
+                        error_str = str(res_json.get("error") or res_json.get("detail"))
+                        state.model_cooldowns[model_key] = time.time() + 30.0
                         logger.warning(f"❌ [{p_name} | {upstream_model}] 200 payload error: {error_str[:300]}")
                         raise HTTPException(status_code=502, detail=f"[{p_name}] {error_str}")
 
