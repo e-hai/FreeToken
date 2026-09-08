@@ -214,9 +214,15 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             for target_m in target_models:
                 t_lower = target_m.lower()
                 for p in active_providers:
+                    p_name_lower = p.get("name", "").lower()
                     for m in p.get("models", []):
                         mid = m.get("id", "").lower()
                         up_name = m.get("upstream_model", mid)
+                        if "openrouter" in p_name_lower:
+                            if not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                                continue
+                            if ":batch" in up_name:
+                                continue
                         if t_lower == mid or t_lower in mid or mid in t_lower or t_lower == up_name.lower():
                             item = (p, up_name)
                             if item not in tier_candidates:
@@ -254,10 +260,16 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
     exact_candidates = []
     fuzzy_candidates = []
     for p in active_providers:
+        p_name_lower = p.get("name", "").lower()
         for m in p.get("models", []):
             mid = m.get("id", "").lower()
             up_name = m.get("upstream_model", mid)
             up_lower = up_name.lower()
+            if "openrouter" in p_name_lower:
+                if not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                    continue
+                if ":batch" in up_name:
+                    continue
             
             if mid in target_keys or up_lower in target_keys:
                 item = (p, up_name)
@@ -290,20 +302,28 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
         "candidates": candidates
     }]
 
-    # 为保障长流程 Agent (如 30+ 轮自动化编码任务) 绝不因上游单模型瞬时超载崩溃，追加紧急保活兜底层
+    # 为保障长流程 Agent (如 30+ 轮自动化编码任务) 绝不因上游单模型瞬时超载或挂起超时而崩溃，追加多维度极速保活兜底层
     emergency_candidates = []
     emergency_target_models = [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "gemini-3.8-flash",
         "openai/gpt-oss-120b",
         "qwen/qwen3.8-27b",
-        "nvidia/nemotron-3-ultra-550b-a55b",
         "gemini-3.5-flash"
     ]
     for target_m in emergency_target_models:
         t_lower = target_m.lower()
         for p in active_providers:
+            p_name_lower = p.get("name", "").lower()
             for m in p.get("models", []):
                 mid = m.get("id", "").lower()
                 up_name = m.get("upstream_model", mid)
+                if "openrouter" in p_name_lower:
+                    if not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                        continue
+                    if ":batch" in up_name:
+                        continue
                 if t_lower == mid or t_lower == up_name.lower() or t_lower in mid:
                     item = (p, up_name)
                     if item not in candidates and item not in emergency_candidates:
@@ -2022,19 +2042,21 @@ async def chat_completions(request: Request):
             p_name = provider.get("name", "Unknown")
             model_key = f"{p_name}:{upstream_model}"
 
-            # 熔断冷却拦截：若模型在过去 30 秒内发生过 429 限流或 503 超载，且当前梯队还有其它候选，则跳过
+            # 熔断冷却拦截：若模型在冷却期内，只要全局执行计划中还有其它未冷却的可用候选，就坚决跳过
             cooldown_until = state.model_cooldowns.get(model_key, 0)
             if now_ts < cooldown_until:
                 has_active_alternative = any(
-                    now_ts >= state.model_cooldowns.get(f"{p.get('name')}:{m}", 0)
-                    for p, m in candidates if f"{p.get('name')}:{m}" != model_key
+                    now_ts >= state.model_cooldowns.get(f"{p_alt.get('name')}:{m_alt}", 0)
+                    for t_alt in tiered_plan
+                    for p_alt, m_alt in t_alt["candidates"]
+                    if f"{p_alt.get('name')}:{m_alt}" != model_key
                 )
                 if has_active_alternative:
                     remain_secs = int(cooldown_until - now_ts)
-                    logger.info(f"⏳ [{p_name} | {upstream_model}] 处于熔断冷却中 (剩余 {remain_secs}s)，快速绕行至同梯队其它可用候选...")
+                    logger.info(f"⏳ [{p_name} | {upstream_model}] 处于熔断冷却中 (剩余 {remain_secs}s)，快速绕行至其它可用候选...")
                     continue
                 else:
-                    logger.info(f"⚡ [{p_name} | {upstream_model}] 处于冷却中但为梯队最后底线，解除冷却尝试调用...")
+                    logger.info(f"⚡ [{p_name} | {upstream_model}] 全网候选均处于冷却中，解除冷却作为最终兜底尝试...")
                     state.model_cooldowns.pop(model_key, None)
 
             base_url = provider.get("base_url", "").rstrip("/")
@@ -2043,10 +2065,63 @@ async def chat_completions(request: Request):
             call_body = dict(forward_body)
             call_body["model"] = upstream_model
 
-            # 过滤非标准端点不支持的参数 (例如 Google 端点不认识 store 导致 400)
+            # 1. Google Gemini 特殊协议适配
             if "google" in base_url.lower() or "generativelanguage" in base_url.lower():
                 call_body.pop("store", None)
                 call_body.pop("metadata", None)
+                # Google Gemini 3.x 严苛要求：当历史消息包含缺少 thought_signature 的非 Gemini 工具调用时，
+                # 会直接报 400 "Function call is missing a thought_signature in functionCall parts"。
+                # 自动将历史非原生 tool_calls 转换为语义一致的上下文消息，保持连续性并规避 400 崩溃
+                messages = call_body.get("messages", [])
+                needs_sanitize = False
+                for m in messages:
+                    if m.get("role") == "assistant" and m.get("tool_calls"):
+                        if not m.get("extra_content", {}).get("google", {}).get("thought_signature"):
+                            needs_sanitize = True
+                            break
+                    elif m.get("role") == "tool":
+                        needs_sanitize = True
+                        break
+
+                if needs_sanitize:
+                    clean_msgs = []
+                    for m in messages:
+                        if m.get("role") == "assistant" and m.get("tool_calls"):
+                            if not m.get("extra_content", {}).get("google", {}).get("thought_signature"):
+                                tc_strs = []
+                                for tc in m["tool_calls"]:
+                                    fn = tc.get("function", {})
+                                    tc_strs.append(f"[Tool Call: {fn.get('name')}({fn.get('arguments', '')})]")
+                                content = (m.get("content") or "")
+                                if tc_strs:
+                                    content = (content + "\n" if content else "") + "\n".join(tc_strs)
+                                m_copy = dict(m)
+                                m_copy.pop("tool_calls", None)
+                                m_copy["content"] = content.strip()
+                                clean_msgs.append(m_copy)
+                                continue
+                        elif m.get("role") == "tool":
+                            clean_msgs.append({
+                                "role": "user",
+                                "content": f"[Tool Output for {m.get('tool_call_id', '')}]: {m.get('content', '')}"
+                            })
+                            continue
+                        clean_msgs.append(m)
+                    call_body["messages"] = clean_msgs
+
+            # 2. Groq Cloud 协议适配
+            if "groq" in base_url.lower():
+                # Groq 严格禁止在 messages 中携带 reasoning_content，否则报 400
+                messages = call_body.get("messages", [])
+                cleaned_messages = []
+                for m in messages:
+                    if isinstance(m, dict) and "reasoning_content" in m:
+                        m_copy = dict(m)
+                        m_copy.pop("reasoning_content", None)
+                        cleaned_messages.append(m_copy)
+                    else:
+                        cleaned_messages.append(m)
+                call_body["messages"] = cleaned_messages
 
             url = f"{base_url}/chat/completions"
             headers = {
@@ -2070,8 +2145,11 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
+                # 智能超时控制：NVIDIA 挂死保护（若遇上游挂起，在 12s 内快速熔断解套）
                 p_timeout = float(provider.get("timeout", 40.0 if is_stream else 50.0))
-                client_timeout = httpx.Timeout(p_timeout, connect=10.0, read=p_timeout, write=30.0, pool=10.0)
+                if "nvidia" in base_url.lower():
+                    p_timeout = min(p_timeout, 12.0)
+                client_timeout = httpx.Timeout(p_timeout, connect=8.0, read=p_timeout, write=20.0, pool=10.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
@@ -2446,9 +2524,13 @@ async def chat_completions(request: Request):
             except Exception as e:
                 latency = int((time.time() - start_time) * 1000)
                 error_msg = str(e)
+                # 无论发生何种异常（超时、网络断开、4xx、5xx），均对该故障模型设置 60s 冷却，防止后续轮次重复踩雷卡死
+                model_key = f"{p_name}:{upstream_model}"
+                state.model_cooldowns[model_key] = time.time() + 60.0
+
                 if isinstance(e, httpx.TimeoutException):
                     error_msg = f"Timeout after {latency}ms ({type(e).__name__})"
-                    logger.warning(f"⏱️ [{p_name} | {upstream_model}] 响应超时 ({latency}ms)，立即极速故障转移 (Failover) 至下一候选...")
+                    logger.warning(f"⏱️ [{p_name} | {upstream_model}] 响应超时 ({latency}ms)，拉入 60s 冷却并立即极速转移 (Failover) 至下一候选...")
                 p_stat["errors"] += 1
                 p_stat["last_error"] = error_msg[:120]
                 p_stat["last_latency_ms"] = latency
