@@ -250,6 +250,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             tier_candidates = []
             for target_m in target_models:
                 t_lower = target_m.lower()
+                m_candidates = []
                 for p in active_providers:
                     p_name_lower = p.get("name", "").lower()
                     for m in p.get("models", []):
@@ -262,14 +263,17 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                                 continue
                         if t_lower == mid or t_lower in mid or mid in t_lower or t_lower == up_name.lower():
                             item = (p, up_name)
-                            if item not in tier_candidates:
-                                tier_candidates.append(item)
+                            if item not in m_candidates and item not in tier_candidates:
+                                m_candidates.append(item)
+                # 针对同一目标模型，按渠道优先级选择最佳渠道商 (如 NVIDIA > OpenRouter)
+                m_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+                tier_candidates.extend(m_candidates)
 
             if has_image:
                 tier_candidates = [item for item in tier_candidates if is_model_vision_capable(item[1])]
 
             if tier_candidates:
-                tier_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+                # 严格保留梯队内目标模型的预设层级天梯顺序 (如 Kimi K3 > Gemini 3.8 > Gemini 3.5 > Nemotron 550B)
                 plan_tiers.append({
                     "tier_name": tier_name,
                     "candidates": tier_candidates
@@ -2147,8 +2151,8 @@ async def chat_completions(request: Request):
                     call_body["messages"] = clean_msgs
 
             if call_body.get("tools"):
-                # 注入强约束提示，确保无论 Nemotron 还是其它模型均携带 required 字段 (如 bash 的 description)
-                desc_hint = "CRITICAL: When calling any tool (such as bash), you MUST supply ALL required arguments, including 'description' (e.g. {\"command\": \"...\", \"description\": \"...\"})."
+                # 注入强约束提示，确保无论 Nemotron 还是其它模型均携带 required 字段 (如 bash 的 description) 且主动发起工具调用
+                desc_hint = "CRITICAL: When calling any tool (such as bash), you MUST supply ALL required arguments, including 'description' (e.g. {\"command\": \"...\", \"description\": \"...\"}). Whenever you intend to inspect, edit, or test code, you MUST execute the corresponding tool immediately in your response rather than only describing your plan in text."
                 msgs = call_body.get("messages", [])
                 if msgs and msgs[0].get("role") == "system":
                     if "description" not in msgs[0].get("content", ""):
@@ -2192,11 +2196,11 @@ async def chat_completions(request: Request):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                # 智能超时控制：NVIDIA 挂死保护（若遇上游挂起，在 12s 内快速熔断解套）
-                p_timeout = float(provider.get("timeout", 40.0 if is_stream else 50.0))
-                if "nvidia" in base_url.lower():
-                    p_timeout = min(p_timeout, 12.0)
-                client_timeout = httpx.Timeout(p_timeout, connect=8.0, read=p_timeout, write=20.0, pool=10.0)
+                # 智能两阶段超时控制：
+                # 1. 阶段一（首包探针）：通过 asyncio.wait_for 设置短超时 (NVIDIA 12s, 其它 18s)，遇挂死立即 503 秒级故障转移
+                # 2. 阶段二（流式生成）：长 read 超时 (120s)，确保大模型 (Kimi K3 / Nemotron 550B / Gemini) 深度思考与长代码完整吐字不被掐断
+                p_read_timeout = 120.0 if is_stream else float(provider.get("timeout", 50.0))
+                client_timeout = httpx.Timeout(p_read_timeout, connect=8.0, read=p_read_timeout, write=30.0, pool=10.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
@@ -2224,15 +2228,18 @@ async def chat_completions(request: Request):
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
                     # 🌟 首包探针：预读取第一块数据，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
+                    # 短超时检测上游是否挂死，超时则抛出 503 触发秒级故障转移
                     stream_iter = response.aiter_bytes()
                     first_chunk = None
                     try:
-                        async for chunk in stream_iter:
-                            first_chunk = chunk
-                            break
+                        peek_timeout = 12.0 if "nvidia" in base_url.lower() else 18.0
+                        first_chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=peek_timeout)
                     except Exception as peek_err:
                         await response.aclose()
                         await client.aclose()
+                        model_key = f"{p_name}:{upstream_model}"
+                        state.model_cooldowns[model_key] = time.time() + 45.0
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接建立后首包读取超时/中断 ({peek_err})，开启 45s 冷却并秒级转移至下一候选...")
                         raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
 
                     # 检查首包是否包含上游超载或报错 (如 NVIDIA/OpenRouter 在 200 SSE 流中推送 error 载荷)
@@ -2286,58 +2293,59 @@ async def chat_completions(request: Request):
                             yield c
 
                     async def stream_generator():
+                        last_chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                        native_tool_calls_seen = False
+                        in_invoke_mode = False
+                        invoke_buffer = ""
+                        pending_tail = ""
+
+                        def build_tool_calls_chunk(tcs, chunk_id):
+                            return {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": requested_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": i,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": tc["function"]
+                                            }
+                                            for i, tc in enumerate(tcs)
+                                        ]
+                                    },
+                                    "finish_reason": None
+                                }]
+                            }
+
+                        def build_finish_chunk(chunk_id, reason="tool_calls"):
+                            return {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": requested_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+                            }
+
+                        def build_content_chunk(chunk_id, text):
+                            return {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": requested_model,
+                                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                            }
+
                         try:
                             if not has_tools:
                                 async for chunk in combined_bytes_iter():
                                     yield chunk
                             else:
                                 buffer = ""
-                                in_invoke_mode = False
-                                invoke_buffer = ""
-                                native_tool_calls_seen = False
-                                pending_tail = ""
-                                last_chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-
-                                def build_tool_calls_chunk(tcs, chunk_id):
-                                    return {
-                                        "id": chunk_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": requested_model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {
-                                                "tool_calls": [
-                                                    {
-                                                        "index": i,
-                                                        "id": tc["id"],
-                                                        "type": "function",
-                                                        "function": tc["function"]
-                                                    }
-                                                    for i, tc in enumerate(tcs)
-                                                ]
-                                            },
-                                            "finish_reason": None
-                                        }]
-                                    }
-
-                                def build_finish_chunk(chunk_id, reason="tool_calls"):
-                                    return {
-                                        "id": chunk_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": requested_model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
-                                    }
-
-                                def build_content_chunk(chunk_id, text):
-                                    return {
-                                        "id": chunk_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": requested_model,
-                                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
-                                    }
 
                                 async def process_sse_msg(msg_raw: str):
                                     nonlocal in_invoke_mode, invoke_buffer, native_tool_calls_seen, pending_tail, last_chunk_id
@@ -2472,8 +2480,40 @@ async def chat_completions(request: Request):
                                     async for out in process_sse_msg(buffer.strip()):
                                         yield out
 
+                                if pending_tail:
+                                    yield f"data: {json.dumps(build_content_chunk(last_chunk_id, pending_tail))}\n\n".encode("utf-8")
+                                    pending_tail = ""
+
+                                if in_invoke_mode and invoke_buffer:
+                                    tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                    if tool_calls:
+                                        logger.info(f"⚡ [Gateway-Rescue] 成功从流末尾提取并转换 {len(tool_calls)} 个 XML 工具调用为标准 OpenAI tool_calls: {[tc['function']['name'] for tc in tool_calls]}")
+                                        yield f"data: {json.dumps(build_tool_calls_chunk(tool_calls, last_chunk_id))}\n\n".encode("utf-8")
+                                        yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
+                                    else:
+                                        yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
+                                        yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                    invoke_buffer = ""
+                                    in_invoke_mode = False
+
                         except Exception as e:
-                            logger.warning(f"Streaming chunk interrupted from [{p_name}]: {e}")
+                            logger.warning(f"Streaming chunk interrupted from [{p_name}]: {repr(e)}")
+                            if pending_tail:
+                                yield f"data: {json.dumps(build_content_chunk(last_chunk_id, pending_tail))}\n\n".encode("utf-8")
+                                pending_tail = ""
+                            if in_invoke_mode and invoke_buffer:
+                                tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                if tool_calls:
+                                    logger.info(f"⚡ [Gateway-Rescue] 异常中断时救援提取 {len(tool_calls)} 个工具调用")
+                                    yield f"data: {json.dumps(build_tool_calls_chunk(tool_calls, last_chunk_id))}\n\n".encode("utf-8")
+                                    yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
+                                else:
+                                    yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
+                                    yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                invoke_buffer = ""
+                                in_invoke_mode = False
+                            elif not native_tool_calls_seen:
+                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
                         finally:
                             try:
                                 await response.aclose()
