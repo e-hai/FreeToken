@@ -132,17 +132,50 @@ def is_model_vision_capable(model_name: str) -> bool:
 
 INVOKE_REGEX = re.compile(r'<(?:invoke|function_call|tool_call)\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</(?:invoke|function_call|tool_call)>|$)', re.DOTALL)
 PARAM_REGEX = re.compile(r'<parameter\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</parameter>|(?=<parameter)|(?=</(?:invoke|function_call|tool_call)>)|$)', re.DOTALL)
-INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8)) + tuple("<function_call"[:i] for i in range(1, 15)) + tuple("<tool_call"[:i] for i in range(1, 11))
+TOOL_CALL_BRACKET_REGEX = re.compile(r'\[Tool Call:\s*([\w\:\-\.]+)(?:\{|\()(.*?)(?:\}|\)\])', re.DOTALL)
+INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8)) + tuple("<function_call"[:i] for i in range(1, 15)) + tuple("<tool_call"[:i] for i in range(1, 11)) + tuple("[Tool Call:"[:i] for i in range(1, 12))
 
 def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
     """
-    Parses <invoke name="...">, <function_call name="...">, and <tool_call name="..."> blocks
-    into standard OpenAI tool_calls structure.
-    Used when DeepSeek-V4 in long context emits XML invoke blocks instead of structured tool_calls.
+    Parses <invoke name="...">, <function_call name="...">, <tool_call name="...">,
+    or [Tool Call: name{...}] blocks into standard OpenAI tool_calls structure.
+    Also ensures required parameters like 'description' for bash are present.
     """
     matches = list(INVOKE_REGEX.finditer(xml_text))
     if not matches:
+        b_matches = list(TOOL_CALL_BRACKET_REGEX.finditer(xml_text))
+        if b_matches:
+            tool_calls = []
+            for bm in b_matches:
+                t_name = bm.group(1).strip()
+                t_body = bm.group(2).strip()
+                args = {}
+                if t_body.startswith("{") and t_body.endswith("}"):
+                    try:
+                        args = json.loads(t_body)
+                    except Exception:
+                        pass
+                if not args:
+                    for part in t_body.split(","):
+                        if ":" in part:
+                            k, v = part.split(":", 1)
+                            args[k.strip()] = v.strip()
+                if not args and t_body:
+                    args["command"] = t_body
+                if ("bash" in t_name or t_name.endswith(":bash")) and "description" not in args:
+                    args["description"] = f"Run: {args.get('command', '')[:60]}"
+                call_id = f"call_{uuid.uuid4().hex[:12]}"
+                tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": t_name,
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                    }
+                })
+            return tool_calls
         return []
+
     tool_calls = []
     for match in matches:
         tool_name = match.group(1).strip()
@@ -156,14 +189,18 @@ def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
                 try:
                     args = json.loads(raw)
                 except Exception:
-                    args = {"command": raw} if tool_name == "bash" else {"input": raw}
+                    args = {"command": raw} if "bash" in tool_name else {"input": raw}
             else:
-                args = {"command": raw} if tool_name == "bash" else {"input": raw}
-        elif tool_name == "bash" and "command" not in args:
+                args = {"command": raw} if "bash" in tool_name else {"input": raw}
+        elif ("bash" in tool_name or tool_name.endswith(":bash")) and "command" not in args:
             if "content" in args:
                 args["command"] = args["content"]
             elif "input" in args:
                 args["command"] = args["input"]
+
+        if ("bash" in tool_name or tool_name.endswith(":bash")) and "description" not in args:
+            args["description"] = f"Run: {args.get('command', '')[:60]}"
+
         call_id = f"call_{uuid.uuid4().hex[:12]}"
         tool_calls.append({
             "id": call_id,
@@ -2091,7 +2128,7 @@ async def chat_completions(request: Request):
                                 tc_strs = []
                                 for tc in m["tool_calls"]:
                                     fn = tc.get("function", {})
-                                    tc_strs.append(f"[Tool Call: {fn.get('name')}({fn.get('arguments', '')})]")
+                                    tc_strs.append(f"Previously executed tool `{fn.get('name')}` with arguments: {fn.get('arguments', '')}")
                                 content = (m.get("content") or "")
                                 if tc_strs:
                                     content = (content + "\n" if content else "") + "\n".join(tc_strs)
@@ -2103,11 +2140,21 @@ async def chat_completions(request: Request):
                         elif m.get("role") == "tool":
                             clean_msgs.append({
                                 "role": "user",
-                                "content": f"[Tool Output for {m.get('tool_call_id', '')}]: {m.get('content', '')}"
+                                "content": f"The output from tool `{m.get('tool_call_id', 'tool')}` was:\n{m.get('content', '')}"
                             })
                             continue
                         clean_msgs.append(m)
                     call_body["messages"] = clean_msgs
+
+            if call_body.get("tools"):
+                # 注入强约束提示，确保无论 Nemotron 还是其它模型均携带 required 字段 (如 bash 的 description)
+                desc_hint = "CRITICAL: When calling any tool (such as bash), you MUST supply ALL required arguments, including 'description' (e.g. {\"command\": \"...\", \"description\": \"...\"})."
+                msgs = call_body.get("messages", [])
+                if msgs and msgs[0].get("role") == "system":
+                    if "description" not in msgs[0].get("content", ""):
+                        msgs[0] = dict(msgs[0])
+                        msgs[0]["content"] = msgs[0]["content"] + f"\n\n{desc_hint}"
+                call_body["messages"] = msgs
 
             # 2. Groq Cloud 协议适配
             if "groq" in base_url.lower():
@@ -2335,6 +2382,15 @@ async def chat_completions(request: Request):
                                     delta = choices[0].get("delta", {})
                                     finish_reason = choices[0].get("finish_reason")
 
+                                    # 规范化异常或非标准 finish_reason (如 Google 返回的 "function_call_filter: MALFORMED_FUNCTION_CALL")
+                                    # 避免下游 pi-ai / OpenAI SDK 将非标准 finish_reason 误判为致命 PI_AI_ERROR 导致整个轮次中断
+                                    if finish_reason and finish_reason not in ["stop", "length", "tool_calls", "content_filter"]:
+                                        if delta.get("tool_calls") or native_tool_calls_seen:
+                                            choices[0]["finish_reason"] = "tool_calls"
+                                        else:
+                                            choices[0]["finish_reason"] = "stop"
+                                        finish_reason = choices[0]["finish_reason"]
+
                                     if delta.get("tool_calls") or native_tool_calls_seen:
                                         native_tool_calls_seen = True
                                         yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
@@ -2369,7 +2425,7 @@ async def chat_completions(request: Request):
                                             pending_tail = ""
 
                                         invoke_tag = None
-                                        for tag in ("<invoke", "<function_call", "<tool_call"):
+                                        for tag in ("<invoke", "<function_call", "<tool_call", "[Tool Call:"):
                                             if tag in content:
                                                 invoke_tag = tag
                                                 break
