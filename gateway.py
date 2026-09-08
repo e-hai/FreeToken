@@ -133,12 +133,14 @@ def is_model_vision_capable(model_name: str) -> bool:
 INVOKE_REGEX = re.compile(r'<(?:invoke|function_call|tool_call)\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</(?:invoke|function_call|tool_call)>|$)', re.DOTALL)
 PARAM_REGEX = re.compile(r'<parameter\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</parameter>|(?=<parameter)|(?=</(?:invoke|function_call|tool_call)>)|$)', re.DOTALL)
 TOOL_CALL_BRACKET_REGEX = re.compile(r'\[Tool Call:\s*([\w\:\-\.]+)(?:\{|\()(.*?)(?:\}|\)\])', re.DOTALL)
-INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8)) + tuple("<function_call"[:i] for i in range(1, 15)) + tuple("<tool_call"[:i] for i in range(1, 11)) + tuple("[Tool Call:"[:i] for i in range(1, 12))
+PREV_TOOL_REGEX = re.compile(r'(?:Previously executed tool|Tool Call|Call tool)\s*[`\'"]?([\w\:\-\.]+)[`\'"]?\s*with arguments:\s*(\{.*)', re.DOTALL)
+INVOKE_PREFIXES = tuple("<invoke"[:i] for i in range(1, 8)) + tuple("<function_call"[:i] for i in range(1, 15)) + tuple("<tool_call"[:i] for i in range(1, 11)) + tuple("[Tool Call:"[:i] for i in range(1, 12)) + tuple("Previously executed tool"[:i] for i in range(5, 25))
 
 def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
     """
     Parses <invoke name="...">, <function_call name="...">, <tool_call name="...">,
-    or [Tool Call: name{...}] blocks into standard OpenAI tool_calls structure.
+    [Tool Call: name{...}], or Previously executed tool `name` with arguments: {...}
+    blocks into standard OpenAI tool_calls structure.
     Also ensures required parameters like 'description' for bash are present.
     """
     matches = list(INVOKE_REGEX.finditer(xml_text))
@@ -162,6 +164,30 @@ def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
                             args[k.strip()] = v.strip()
                 if not args and t_body:
                     args["command"] = t_body
+                if ("bash" in t_name or t_name.endswith(":bash")) and "description" not in args:
+                    args["description"] = f"Run: {args.get('command', '')[:60]}"
+                call_id = f"call_{uuid.uuid4().hex[:12]}"
+                tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": t_name,
+                        "arguments": json.dumps(args, ensure_ascii=False)
+                    }
+                })
+            return tool_calls
+
+        p_matches = list(PREV_TOOL_REGEX.finditer(xml_text))
+        if p_matches:
+            tool_calls = []
+            for pm in p_matches:
+                t_name = pm.group(1).strip()
+                t_body = pm.group(2).strip()
+                args = {}
+                try:
+                    args = json.loads(t_body)
+                except Exception:
+                    pass
                 if ("bash" in t_name or t_name.endswith(":bash")) and "description" not in args:
                     args["description"] = f"Run: {args.get('command', '')[:60]}"
                 call_id = f"call_{uuid.uuid4().hex[:12]}"
@@ -214,15 +240,28 @@ def parse_xml_to_tool_calls(xml_text: str) -> List[Dict[str, Any]]:
 
 def extract_and_convert_xml_tool_calls(text: str):
     """
-    Splits out thinking/explanation text and parses XML tool calls.
+    Splits out thinking/explanation text and parses XML/custom tool calls.
     Returns: (cleaned_text, tool_calls_list)
     """
-    if not text or not any(k in text for k in ("<invoke", "<function_call", "<tool_call")):
+    if not text or not any(k in text for k in ("<invoke", "<function_call", "<tool_call", "[Tool Call:", "Previously executed tool")):
         return text, []
-    matches = list(INVOKE_REGEX.finditer(text))
-    if not matches:
+
+    first_start = -1
+    for m in INVOKE_REGEX.finditer(text):
+        first_start = m.start()
+        break
+    if first_start == -1:
+        for m in TOOL_CALL_BRACKET_REGEX.finditer(text):
+            first_start = m.start()
+            break
+    if first_start == -1:
+        for m in PREV_TOOL_REGEX.finditer(text):
+            first_start = m.start()
+            break
+
+    if first_start == -1:
         return text, []
-    first_start = matches[0].start()
+
     cleaned_text = text[:first_start].strip()
     tool_calls = parse_xml_to_tool_calls(text)
     return cleaned_text, tool_calls
@@ -2110,45 +2149,6 @@ async def chat_completions(request: Request):
             if "google" in base_url.lower() or "generativelanguage" in base_url.lower():
                 call_body.pop("store", None)
                 call_body.pop("metadata", None)
-                # Google Gemini 3.x 严苛要求：当历史消息包含缺少 thought_signature 的非 Gemini 工具调用时，
-                # 会直接报 400 "Function call is missing a thought_signature in functionCall parts"。
-                # 自动将历史非原生 tool_calls 转换为语义一致的上下文消息，保持连续性并规避 400 崩溃
-                messages = call_body.get("messages", [])
-                needs_sanitize = False
-                for m in messages:
-                    if m.get("role") == "assistant" and m.get("tool_calls"):
-                        if not m.get("extra_content", {}).get("google", {}).get("thought_signature"):
-                            needs_sanitize = True
-                            break
-                    elif m.get("role") == "tool":
-                        needs_sanitize = True
-                        break
-
-                if needs_sanitize:
-                    clean_msgs = []
-                    for m in messages:
-                        if m.get("role") == "assistant" and m.get("tool_calls"):
-                            if not m.get("extra_content", {}).get("google", {}).get("thought_signature"):
-                                tc_strs = []
-                                for tc in m["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    tc_strs.append(f"Previously executed tool `{fn.get('name')}` with arguments: {fn.get('arguments', '')}")
-                                content = (m.get("content") or "")
-                                if tc_strs:
-                                    content = (content + "\n" if content else "") + "\n".join(tc_strs)
-                                m_copy = dict(m)
-                                m_copy.pop("tool_calls", None)
-                                m_copy["content"] = content.strip()
-                                clean_msgs.append(m_copy)
-                                continue
-                        elif m.get("role") == "tool":
-                            clean_msgs.append({
-                                "role": "user",
-                                "content": f"The output from tool `{m.get('tool_call_id', 'tool')}` was:\n{m.get('content', '')}"
-                            })
-                            continue
-                        clean_msgs.append(m)
-                    call_body["messages"] = clean_msgs
 
             if call_body.get("tools"):
                 # 注入强约束提示，确保无论 Nemotron 还是其它模型均携带 required 字段 (如 bash 的 description) 且主动发起工具调用
@@ -2433,7 +2433,7 @@ async def chat_completions(request: Request):
                                             pending_tail = ""
 
                                         invoke_tag = None
-                                        for tag in ("<invoke", "<function_call", "<tool_call", "[Tool Call:"):
+                                        for tag in ("<invoke", "<function_call", "<tool_call", "[Tool Call:", "Previously executed tool"):
                                             if tag in content:
                                                 invoke_tag = tag
                                                 break
