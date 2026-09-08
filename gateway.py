@@ -1753,10 +1753,19 @@ async def fetch_and_update_latest_free_models() -> dict:
         ],
         "NVIDIA NIM": [
             "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             "meta/llama-3.2-11b-vision-instruct",
-            "deepseek-ai/deepseek-v4-pro-0813",
+            "minimaxai/minimax-m3",
+            "google/diffusiongemma-26b-a4b-it",
+            "poolside/laguna-xs-2.1",
+            "openai/gpt-oss-20b",
             "deepseek-ai/deepseek-v4-flash-0731",
-            "meta/llama-3.3-70b-instruct"
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-coder-6.7b-instruct",
+            "mistralai/codestral-22b-instruct-v0.1",
+            "01-ai/yi-large"
         ],
         "OpenRouter (Global)": [
             "thinkingmachines/inkling-small:free",
@@ -1820,6 +1829,7 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "gemini-3.5-flash",
                     "gemini-flash-latest",
                     "nvidia/nemotron-3-ultra-550b-a55b",
+                    "nvidia/nemotron-3-super-120b-a12b",
                     "openai/gpt-oss-120b",
                     "qwen/qwen3.8-27b"
                 ]
@@ -1830,12 +1840,15 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "openai/gpt-oss-120b",
                     "qwen/qwen3.8-27b",
                     "groq/compound-mini",
-                    "meta/llama-3.2-11b-vision-instruct"
+                    "meta/llama-3.2-11b-vision-instruct",
+                    "nvidia/nemotron-3.5-lightning-30b-a3b"
                 ]
             },
             {
                 "tier": "Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Cohere Code / Dots 512K)",
                 "models": [
+                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                    "minimaxai/minimax-m3",
                     "thinkingmachines/inkling-small:free",
                     "thinkingmachines/inkling:free",
                     "cohere/north-mini-code:free",
