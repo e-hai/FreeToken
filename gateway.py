@@ -1752,6 +1752,7 @@ async def fetch_and_update_latest_free_models() -> dict:
             "llama-3.1-8b-instant"
         ],
         "NVIDIA NIM": [
+            "moonshotai/kimi-k3",
             "nvidia/nemotron-3-ultra-550b-a55b",
             "nvidia/nemotron-3-super-120b-a12b",
             "nvidia/nemotron-3.5-lightning-30b-a3b",
@@ -1828,6 +1829,7 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "gemini-3.8-flash",
                     "gemini-3.5-flash",
                     "gemini-flash-latest",
+                    "moonshotai/kimi-k3",
                     "nvidia/nemotron-3-ultra-550b-a55b",
                     "nvidia/nemotron-3-super-120b-a12b",
                     "openai/gpt-oss-120b",
@@ -1847,6 +1849,7 @@ async def fetch_and_update_latest_free_models() -> dict:
             {
                 "tier": "Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Cohere Code / Dots 512K)",
                 "models": [
+                    "moonshotai/kimi-k3",
                     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
                     "minimaxai/minimax-m3",
                     "thinkingmachines/inkling-small:free",
