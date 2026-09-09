@@ -35,7 +35,7 @@ def analyze_image(image_path: str, prompt: str = "请详细描述此图片中的
         return f"❌ 读取图片文件失败: {str(e)}"
 
     payload = {
-        "model": "auto",  # 自动走网关的顶级视觉模型 (Google Gemini 3.5 Flash)
+        "model": "vision",  # 显式直连网关的专属多模态视觉天梯 (Google Gemini 3.8 / 3.6 / 3.5 Flash)
         "messages": [
             {
                 "role": "user",

@@ -277,15 +277,14 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
     # 按大厂优先级权重排序 (NVIDIA 100 > Google 95 > Groq 90 > OpenRouter 85 > 中转 40)
     active_providers.sort(key=lambda p: p.get("priority", 50), reverse=True)
 
-    # 1. 当请求 "auto" 时，执行跨大厂多级降级天梯
-    if req_clean in ["auto", "default"]:
+    # 1. 当请求 "vision" 时，执行专属多模态视觉天梯 (Google Gemini 3.8 / 3.6 / 3.5 Flash 优先)
+    if req_clean in ["vision", "vision-agent", "gemini-vision"]:
         ladders_config = state.config.get("fallback_ladders", {})
-        ladder = ladders_config.get("auto", [])
+        ladder = ladders_config.get("vision", [])
         plan_tiers = []
         for tier_info in ladder:
-            tier_name = tier_info.get("tier", "Fallback Tier")
+            tier_name = tier_info.get("tier", "Vision Tier")
             target_models = tier_info.get("models", [])
-            
             tier_candidates = []
             for target_m in target_models:
                 t_lower = target_m.lower()
@@ -304,19 +303,156 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                             item = (p, up_name)
                             if item not in m_candidates and item not in tier_candidates:
                                 m_candidates.append(item)
-                # 针对同一目标模型，按渠道优先级选择最佳渠道商 (如 NVIDIA > OpenRouter)
                 m_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
                 tier_candidates.extend(m_candidates)
-
-            if has_image:
-                tier_candidates = [item for item in tier_candidates if is_model_vision_capable(item[1])]
-
+            tier_candidates = tier_candidates[:10]
             if tier_candidates:
-                # 严格保留梯队内目标模型的预设层级天梯顺序 (如 Kimi K3 > Gemini 3.8 > Gemini 3.5 > Nemotron 550B)
                 plan_tiers.append({
                     "tier_name": tier_name,
                     "candidates": tier_candidates
                 })
+        return plan_tiers
+
+    # 2. 当请求 "auto" 时，执行【渠道商首选独占容灾天梯】(单个渠道商中已配置大模型全部失败后，再去切换下一个渠道商)
+    if req_clean in ["auto", "default"]:
+        plan_tiers = []
+
+        if has_image:
+            # 视觉模式：专属多模态渠道天梯 (Google AI Studio 顶级视觉优先 -> NVIDIA NIM 视觉兜底)
+            vision_providers = [p for p in active_providers if any(is_model_vision_capable(m.get("id", "")) or is_model_vision_capable(m.get("upstream_model", "")) for m in p.get("models", []))]
+            vision_providers.sort(key=lambda p: p.get("priority", 50), reverse=True)
+            for p in vision_providers:
+                p_name = p.get("name", "Unknown")
+                p_priority = p.get("priority", 50)
+                v_models = []
+                for m in p.get("models", []):
+                    mid = m.get("id", "")
+                    up_name = m.get("upstream_model", mid)
+                    if not up_name or ":batch" in up_name:
+                        continue
+                    if "openrouter" in p_name.lower() and not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                        continue
+                    if is_model_vision_capable(up_name) and up_name not in v_models:
+                        v_models.append(up_name)
+                if v_models:
+                    plan_tiers.append({
+                        "tier_name": f"多模态视觉渠道商天梯: [{p_name}] (优先级 {p_priority})",
+                        "candidates": [(p, m) for m in v_models]
+                    })
+            return plan_tiers
+
+        # 编程与通用推理模式：单个渠道商中所有已配置模型全部失败后再切换下一个渠道商
+        NON_CHAT_KEYWORDS = [
+            "embed", "guard", "safeguard", "clip", "reward", "parse", "detector",
+            "deplot", "tts", "transcribe", "whisper", "diffusion", "veo", "lyria",
+            "video", "audio", "fuyu", "kosmos", "vila", "neva", "synthetic", "calibration",
+            "content-safety", "translate", "creative", "med", "fin", "orpheus", "allam"
+        ]
+
+        NVIDIA_PREFERRED = [
+            "moonshotai/kimi-k3",
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "minimaxai/minimax-m3",
+            "meta/llama-3.3-70b-instruct",
+            "deepseek-ai/deepseek-coder-6.7b-instruct",
+            "mistralai/codestral-22b-instruct-v0.1",
+            "01-ai/yi-large",
+            "mistralai/mistral-large-2-instruct",
+            "google/gemma-4-31b-it"
+        ]
+
+        GROQ_PREFERRED = [
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-120b",
+            "groq/compound-mini",
+            "groq/compound",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3.6-27b",
+            "llama-3.1-8b-instant",
+            "openai/gpt-oss-20b"
+        ]
+
+        OPENROUTER_PREFERRED = [
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "cohere/north-mini-code:free",
+            "dots-studio/dots-3-note-preview:free",
+            "minimax/minimax-m3:free",
+            "thinkingmachines/inkling:free",
+            "thinkingmachines/inkling-small:free",
+            "google/gemma-4-31b-it:free",
+            "openrouter/free"
+        ]
+
+        # 遍历所有活跃渠道商 (按优先级降序：NVIDIA NIM 100 > Groq Cloud 90 > OpenRouter 85)
+        for p in active_providers:
+            p_name = p.get("name", "Unknown")
+            p_name_lower = p_name.lower()
+            p_priority = p.get("priority", 50)
+
+            # 编程模式：100% 杜绝 Gemini 参与代码生成，仅保留纯编程与推理旗舰渠道
+            if "google" in p_name_lower or "gemini" in p_name_lower:
+                continue
+
+            raw_models = p.get("models", [])
+            available_upstreams = []
+            for m in raw_models:
+                mid = m.get("id", "")
+                up_name = m.get("upstream_model", mid)
+                if not up_name or ":batch" in up_name:
+                    continue
+                up_low = up_name.lower()
+                if any(k in up_low for k in NON_CHAT_KEYWORDS):
+                    continue
+                if "gemini" in up_low:
+                    continue
+                if "openrouter" in p_name_lower:
+                    if not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                        continue
+                if up_name not in available_upstreams:
+                    available_upstreams.append(up_name)
+
+            # 确定当前渠道内的模型优选执行天梯
+            if "nvidia" in p_name_lower:
+                pref_list = NVIDIA_PREFERRED
+            elif "groq" in p_name_lower:
+                pref_list = GROQ_PREFERRED
+            elif "openrouter" in p_name_lower:
+                pref_list = OPENROUTER_PREFERRED
+            else:
+                pref_list = []
+
+            ordered_models = []
+            # 1. 优先将渠道内的核心旗舰模型排在最前
+            for pref in pref_list:
+                pref_low = pref.lower()
+                matched = [
+                    u for u in available_upstreams 
+                    if u.lower() == pref_low or pref_low in u.lower() or u.lower() in pref_low
+                ]
+                for m in matched:
+                    if m not in ordered_models:
+                        ordered_models.append(m)
+
+            # 2. 将该渠道商中其它已配置的聊天/编程模型作为后备候选排入当前天梯
+            for u in available_upstreams:
+                if u not in ordered_models:
+                    ordered_models.append(u)
+
+            # 各渠道商严格只保留前10个性能最好的大模型
+            ordered_models = ordered_models[:10]
+            if ordered_models:
+                tier_candidates = [(p, m) for m in ordered_models]
+                plan_tiers.append({
+                    "tier_name": f"渠道商独占容灾天梯: [{p_name}] (优先级 {p_priority})",
+                    "candidates": tier_candidates
+                })
+
         return plan_tiers
 
     # 2. 当请求 "deepseek-v4-flash"（或指定模型）时，大厂优先轮询目标模型，并追加紧急高可用保活层
@@ -383,15 +519,29 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
     }]
 
     # 为保障长流程 Agent (如 30+ 轮自动化编码任务) 绝不因上游单模型瞬时超载或挂起超时而崩溃，追加多维度极速保活兜底层
+    if not has_image:
+        candidates = [c for c in candidates if "gemini" not in c[1].lower()]
+
     emergency_candidates = []
-    emergency_target_models = [
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "nvidia/nemotron-3-super-120b-a12b",
-        "gemini-3.8-flash",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.8-27b",
-        "gemini-3.5-flash"
-    ]
+    if not has_image:
+        # 编程长会话：100% 杜绝 Gemini 介入，严格使用顶级代码/推理大模型兜底
+        emergency_target_models = [
+            "moonshotai/kimi-k3",
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "openrouter/free"
+        ]
+    else:
+        # 视觉会话：由 Google Gemini 旗舰与开源多模态接管
+        emergency_target_models = [
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "meta/llama-3.2-11b-vision-instruct"
+        ]
     for target_m in emergency_target_models:
         t_lower = target_m.lower()
         for p in active_providers:
@@ -1067,7 +1217,7 @@ async def dashboard():
                 <div class="card-header">
                     <div class="card-title">
                         <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                        <span>Gateway Core Models · 网关保留的核心模型 (2 个)</span>
+                        <span>Gateway Core Models · 网关保留的核心模型 (3 个)</span>
                     </div>
                     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                         <span class="card-subtitle" style="margin:0;">DeepSeek-Harness 与客户端暴露模型</span>
@@ -1080,11 +1230,11 @@ async def dashboard():
                 <div class="models-showcase">
                     <div class="model-card" style="border-color: rgba(94, 106, 210, 0.4); background: rgba(94, 106, 210, 0.04);">
                         <div class="model-card-top">
-                            <div class="model-card-id" style="color: #a5b4fc;">✨ auto (推荐默认)</div>
-                            <span class="badge badge-priority">大厂优先 · 多级智能降级</span>
+                            <div class="model-card-id" style="color: #a5b4fc;">✨ auto (编程/推理默认)</div>
+                            <span class="badge badge-priority">顶级大厂 · 纯编程旗舰</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>全网自适应降级：</strong>优先直连 Google Gemini 3.5 旗舰与 NVIDIA 70B 满血推理，遇限流毫秒级切换 Groq LPU 极速芯片 (700ms) 及 OpenRouter 免费池，保障 100% 成功率。
+                            <strong>纯代码/推理自适应天梯：</strong>优先调度 NVIDIA Kimi K3、DeepSeek V4、Nemotron 550B 及 Qwen 3.8，<strong>100% 隔离视觉模型</strong>，杜绝因视觉模型参数不兼容导致的长流程编程中断。
                         </div>
                     </div>
                     <div class="model-card" style="border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.04);">
@@ -1093,7 +1243,16 @@ async def dashboard():
                             <span class="badge badge-success">同模型跨渠道轮询</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>专属指定模型：</strong>严格锁定 DeepSeek 官方 V4-Flash 极速推理架构，仅在支持该模型的各渠道商间轮询（大厂优先）；若全部渠道均不可用则直接报错，绝不跨模型降级。
+                            <strong>专属代码指定模型：</strong>严格锁定 DeepSeek 官方 V4-Flash 极速推理架构，仅在支持该模型的各渠道商间轮询（大厂优先）；若全部渠道均不可用则直接报错，绝不跨模型降级。
+                        </div>
+                    </div>
+                    <div class="model-card" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.04);">
+                        <div class="model-card-top">
+                            <div class="model-card-id" style="color: #fbbf24;">👁️ vision (多模态视觉专属)</div>
+                            <span class="badge" style="background:rgba(245, 158, 11, 0.15);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.3);">视觉外挂 · 100万上下文</span>
+                        </div>
+                        <div class="model-card-desc">
+                            <strong>多模态视觉分析天梯：</strong>专供 Google Gemini 3.8 / 3.6 / 3.5 Flash 顶级视觉模型，用于 UI 还原、组件布局提取、报错截屏 OCR、设计稿审查，与编程 Agent 完美解耦。
                         </div>
                     </div>
                 </div>
@@ -1208,8 +1367,9 @@ async def dashboard():
                         <strong>Base URL</strong>: http://127.0.0.1:{state.config['server']['port']}/v1<br>
                         <strong>API Key </strong>: free-token<br>
                         <strong>Available Models</strong>:<br>
-                        &nbsp;&nbsp;1. <strong>auto</strong> (推荐：大厂优先 · 全网自适应降级)<br>
-                        &nbsp;&nbsp;2. <strong>deepseek-v4-flash</strong> (DeepSeek 极速架构 · 同模型轮询)
+                        &nbsp;&nbsp;1. <strong>auto</strong> (推荐：顶级大厂代码与推理自适应降级)<br>
+                        &nbsp;&nbsp;2. <strong>deepseek-v4-flash</strong> (DeepSeek 极速架构 · 同模型轮询)<br>
+                        &nbsp;&nbsp;3. <strong>vision</strong> (多模态视觉专属 · Google Gemini 3.8 Flash)
                     </div>
                     <div class="snippet-box">
                         <strong style="color:var(--linear-brand);">Python / OpenAI SDK:</strong><br>
@@ -1924,29 +2084,26 @@ async def fetch_and_update_latest_free_models() -> dict:
         p["models"] = new_top_models
         updated_providers.append(p_name)
 
-    # Synchronize fallback ladders for "auto" (确保顶级旗舰排在首位)
+    # Synchronize fallback ladders for "auto" and "vision" (严格代码与视觉隔离)
     state.config["fallback_ladders"] = {
         "auto": [
             {
-                "tier": "Tier 1: 大厂满血旗舰层 (NVIDIA Kimi K3 / Google Gemini 3.8 / 3.5 · 100万上下文)",
+                "tier": "Tier 1: 顶级大厂编程与推理旗舰层 (NVIDIA Kimi K3 / DeepSeek V4 / Groq Qwen 3.8 / GPT-OSS 120B / Nemotron 550B)",
                 "models": [
                     "moonshotai/kimi-k3",
-                    "gemini-3.8-flash",
-                    "gemini-3.5-flash",
-                    "gemini-flash-latest",
-                    "nvidia/nemotron-3-ultra-550b-a55b",
-                    "nvidia/nemotron-3-super-120b-a12b",
+                    "deepseek-ai/deepseek-v4-flash-0731",
+                    "qwen/qwen3.8-27b",
                     "openai/gpt-oss-120b",
-                    "qwen/qwen3.8-27b"
+                    "nvidia/nemotron-3-ultra-550b-a55b",
+                    "nvidia/nemotron-3-super-120b-a12b"
                 ]
             },
             {
-                "tier": "Tier 2: LPU 极速芯片与视觉层 (Groq Qwen 3.8 / GPT-OSS 120B / Llama 3.2 视觉)",
+                "tier": "Tier 2: LPU 极速芯片编程层 (Groq Qwen 3.8 / GPT-OSS 120B / Nemotron 3.5)",
                 "models": [
                     "openai/gpt-oss-120b",
                     "qwen/qwen3.8-27b",
                     "groq/compound-mini",
-                    "meta/llama-3.2-11b-vision-instruct",
                     "nvidia/nemotron-3.5-lightning-30b-a3b"
                 ]
             },
@@ -1961,8 +2118,7 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "cohere/north-mini-code:free",
                     "dots-studio/dots-3-note-preview:free",
                     "nvidia/nemotron-3.5-lightning:free",
-                    "minimax/minimax-m3:free",
-                    "gemini-flash-lite-latest"
+                    "minimax/minimax-m3:free"
                 ]
             },
             {
@@ -1971,8 +2127,26 @@ async def fetch_and_update_latest_free_models() -> dict:
                     "openrouter/free"
                 ]
             }
+        ],
+        "vision": [
+            {
+                "tier": "Tier 1: Google Gemini 顶级多模态视觉旗舰层 (Gemini 3.8 / 3.6 / 3.5 Flash · 100万上下文)",
+                "models": [
+                    "gemini-3.8-flash",
+                    "gemini-3.6-flash",
+                    "gemini-3.5-flash",
+                    "gemini-flash-latest"
+                ]
+            },
+            {
+                "tier": "Tier 2: 开源极速多模态视觉兜底层 (Llama 3.2 11B Vision)",
+                "models": [
+                    "meta/llama-3.2-11b-vision-instruct"
+                ]
+            }
         ]
     }
+    state.config["exposed_models"] = ["auto", "deepseek-v4-flash", "vision"]
 
     save_config(state.config)
     state.reload_config()
@@ -2089,8 +2263,8 @@ async def chat_completions(request: Request):
     # 若包含图像输入且请求模型为非原生视觉模型，自动无缝调度至顶级多模态视觉模型天梯
     effective_model = requested_model
     if has_image and not is_model_vision_capable(requested_model):
-        logger.info(f"👁️ 【多模态视觉智能协同】检测到图像输入！[{requested_model}] 无原生视觉感知能力，已自动无缝切换至多模态视觉天梯 (Google Gemini 3.8 / 3.5 / Llama 3.2 Vision)...")
-        effective_model = "auto"
+        logger.info(f"👁️ 【多模态视觉智能协同】检测到图像输入！[{requested_model}] 无原生视觉感知能力，已自动无缝切换至多模态视觉专属天梯 (Google Gemini 3.8 / 3.6 / 3.5 Flash)...")
+        effective_model = "vision"
 
     tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image)
     if not tiered_plan:
@@ -2113,14 +2287,16 @@ async def chat_completions(request: Request):
     for tier_idx, tier_obj in enumerate(tiered_plan, 1):
         tier_name = tier_obj["tier_name"]
         candidates = tier_obj["candidates"]
+        logger.info(f"🏛️ 【渠道商天梯 Tier {tier_idx}/{len(tiered_plan)}】启动: {tier_name} (包含 {len(candidates)} 个候选模型)")
 
         now_ts = time.time()
         # 清理已过期的模型熔断冷却
         state.model_cooldowns = {k: v for k, v in state.model_cooldowns.items() if v > now_ts}
 
-        for provider, upstream_model in candidates:
+        for cand_idx, (provider, upstream_model) in enumerate(candidates, 1):
             p_name = provider.get("name", "Unknown")
             model_key = f"{p_name}:{upstream_model}"
+            logger.info(f"👉 [{p_name}] 正在尝试候选模型 ({cand_idx}/{len(candidates)}): {upstream_model}...")
 
             # 熔断冷却拦截：若模型在冷却期内，只要全局执行计划中还有其它未冷却的可用候选，就坚决跳过
             cooldown_until = state.model_cooldowns.get(model_key, 0)
@@ -2205,7 +2381,15 @@ async def chat_completions(request: Request):
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
-                    response = await client.send(req, stream=True)
+                    initial_header_timeout = 15.0 if "nvidia" in base_url.lower() else 18.0
+                    try:
+                        response = await asyncio.wait_for(client.send(req, stream=True), timeout=initial_header_timeout)
+                    except Exception as header_err:
+                        await client.aclose()
+                        model_key = f"{p_name}:{upstream_model}"
+                        state.model_cooldowns[model_key] = time.time() + 90.0
+                        logger.warning(f"⏱️ [{p_name} | {upstream_model}] 建立流式连接与等待响应头超时 ({header_err})，拉入 90s 冷却并秒级转移至下一候选...")
+                        raise HTTPException(status_code=504, detail=f"[{p_name}] 等待响应头超时: {header_err}")
 
                     # 若遇到瞬时超载 (529/503) 或限流 (429)，开启 30s 冷却并秒级故障转移至下一候选
                     if response.status_code in [429, 503, 529]:
@@ -2214,6 +2398,7 @@ async def chat_completions(request: Request):
                         logger.warning(f"⚠️ [{p_name} | {upstream_model}] 遇到限流/超载 (HTTP {response.status_code})，开启 30s 冷却并秒级转移至下一候选！")
                         await response.aclose()
                         await client.aclose()
+                        model_key = f"{p_name}:{upstream_model}"
                         state.model_cooldowns[model_key] = time.time() + 30.0
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] 服务瞬时限流/超载 (HTTP {response.status_code}): {error_str[:200]}")
 
@@ -2227,32 +2412,37 @@ async def chat_completions(request: Request):
                         state.model_cooldowns[model_key] = time.time() + 30.0
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
-                    # 🌟 首包探针：预读取第一块数据，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
-                    # 短超时检测上游是否挂死，超时则抛出 503 触发秒级故障转移
+                    # 🌟 首包探针：预读取前 1-3 块数据，跳过 SSE 注释行（如 OpenRouter 的 ': OPENROUTER PROCESSING\n\n'）
+                    # 短超时检测上游是否挂死，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
                     stream_iter = response.aiter_bytes()
-                    first_chunk = None
+                    peek_chunks = []
                     try:
                         peek_timeout = 12.0 if "nvidia" in base_url.lower() else 18.0
-                        first_chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=peek_timeout)
+                        while len(peek_chunks) < 3:
+                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=peek_timeout)
+                            peek_chunks.append(chunk)
+                            if not chunk.strip().startswith(b":"):
+                                break
+                    except StopIteration:
+                        pass
                     except Exception as peek_err:
                         await response.aclose()
                         await client.aclose()
                         model_key = f"{p_name}:{upstream_model}"
-                        state.model_cooldowns[model_key] = time.time() + 45.0
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接建立后首包读取超时/中断 ({peek_err})，开启 45s 冷却并秒级转移至下一候选...")
+                        state.model_cooldowns[model_key] = time.time() + 60.0
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接建立后首包读取超时/中断 ({peek_err})，开启 60s 冷却并秒级转移至下一候选...")
                         raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
 
-                    # 检查首包是否包含上游超载或报错 (如 NVIDIA/OpenRouter 在 200 SSE 流中推送 error 载荷)
-                    if first_chunk:
-                        chunk_lower = first_chunk.lower()
-                        if (b'"error"' in chunk_lower or b'"detail"' in chunk_lower or b'overload' in chunk_lower) and b'"choices"' not in chunk_lower:
-                            await response.aclose()
-                            await client.aclose()
-                            error_peek_str = first_chunk.decode("utf-8", errors="ignore")
-                            logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务超载/报错: {error_peek_str[:200]}，开启 30s 冷却并秒级转移至下一候选渠道！")
-                            model_key = f"{p_name}:{upstream_model}"
-                            state.model_cooldowns[model_key] = time.time() + 30.0
-                            raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包超载: {error_peek_str[:200]}")
+                    # 检查已探测的块是否包含上游超载或报错 (如 OpenRouter / NVIDIA 在 200 SSE 流中推送 error 载荷)
+                    combined_peek = b"".join(peek_chunks).lower()
+                    if (b'"error"' in combined_peek or b'"detail"' in combined_peek or b'overload' in combined_peek) and b'"choices"' not in combined_peek:
+                        await response.aclose()
+                        await client.aclose()
+                        error_peek_str = b"".join(peek_chunks).decode("utf-8", errors="ignore")
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 流式首包检测到服务超载/报错: {error_peek_str[:200]}，开启 60s 冷却并秒级转移至下一候选渠道！")
+                        model_key = f"{p_name}:{upstream_model}"
+                        state.model_cooldowns[model_key] = time.time() + 60.0
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 流式首包超载: {error_peek_str[:200]}")
 
                     latency = int((time.time() - start_time) * 1000)
                     total_latency = int((time.time() - req_start_time) * 1000)
@@ -2287,8 +2477,8 @@ async def chat_completions(request: Request):
                     has_tools = bool(call_body.get("tools"))
 
                     async def combined_bytes_iter():
-                        if first_chunk:
-                            yield first_chunk
+                        for c in peek_chunks:
+                            yield c
                         async for c in stream_iter:
                             yield c
 
@@ -2382,9 +2572,32 @@ async def chat_completions(request: Request):
                                     if "id" in chunk_json:
                                         last_chunk_id = chunk_json["id"]
 
+                                    # 拦截上游在 SSE 块中推送的 error 载荷 (如 OpenRouter 报错 "Upstream error from Nvidia: Service temporarily overloaded")
+                                    # 严禁将 error JSON 透传给下游，否则 pi-ai / OpenAI SDK 将直接抛出致命 PI_AI_ERROR 导致整个轮次中断
+                                    if "error" in chunk_json or "detail" in chunk_json:
+                                        err_msg = str(chunk_json.get("error") or chunk_json.get("detail"))
+                                        logger.warning(f"⚠️ [SSE-Error-Intercept] 拦截到上游流中推送的错误载荷: {err_msg[:200]}，安全静默关闭，绝不向客户端抛出 PI_AI_ERROR")
+                                        if in_invoke_mode and invoke_buffer:
+                                            tool_calls = parse_xml_to_tool_calls(invoke_buffer)
+                                            if tool_calls:
+                                                yield f"data: {json.dumps(build_tool_calls_chunk(tool_calls, last_chunk_id))}\n\n".encode("utf-8")
+                                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
+                                            else:
+                                                yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
+                                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                            invoke_buffer = ""
+                                            in_invoke_mode = False
+                                        elif pending_tail:
+                                            yield f"data: {json.dumps(build_content_chunk(last_chunk_id, pending_tail))}\n\n".encode("utf-8")
+                                            yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                            pending_tail = ""
+                                        elif not native_tool_calls_seen:
+                                            yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                        yield b"data: [DONE]\n\n"
+                                        return
+
                                     choices = chunk_json.get("choices", [])
                                     if not choices:
-                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
                                         return
 
                                     delta = choices[0].get("delta", {})
@@ -2624,7 +2837,7 @@ async def chat_completions(request: Request):
                 model_key = f"{p_name}:{upstream_model}"
                 state.model_cooldowns[model_key] = time.time() + 60.0
 
-                if isinstance(e, httpx.TimeoutException):
+                if isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError)):
                     error_msg = f"Timeout after {latency}ms ({type(e).__name__})"
                     logger.warning(f"⏱️ [{p_name} | {upstream_model}] 响应超时 ({latency}ms)，拉入 60s 冷却并立即极速转移 (Failover) 至下一候选...")
                 p_stat["errors"] += 1
@@ -2643,6 +2856,7 @@ async def chat_completions(request: Request):
                 total_retries += 1
                 state.stats["failover_events"] += 1
                 continue
+        logger.warning(f"⚠️ 【渠道商天梯 Tier {tier_idx} - {tier_name}】内所有 {len(candidates)} 个候选模型均已尝试失败或处于冷却中，自动晋级切换至下一个渠道商...")
 
     total_latency = int((time.time() - req_start_time) * 1000)
     state.stats["failed_requests"] += 1
