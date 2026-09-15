@@ -22,7 +22,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Gateway")
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+def _resolve_config_path() -> str:
+    env_path = os.environ.get("CONFIG_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    root_config = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+    if os.path.exists(root_config):
+        return root_config
+    src_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+    if os.path.exists(src_config):
+        return src_config
+    return root_config
+
+CONFIG_PATH = _resolve_config_path()
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):

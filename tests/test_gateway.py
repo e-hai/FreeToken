@@ -7,6 +7,9 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+
+# 确保无论从何处运行均可正确导入 src/gateway
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from gateway import app, state, GatewayState
 
 mock_app = FastAPI()

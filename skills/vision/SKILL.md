@@ -21,7 +21,7 @@ vision "<图片文件路径>" "<具体的分析要求或提问>"
 ```
 *备用完整 Python 路径*：
 ```bash
-python3 /Users/a/Develop/project/free-token/vision_mcp.py "<图片文件路径>" "<具体的分析要求或提问>"
+python3 tools/vision_mcp.py "<图片文件路径>" "<具体的分析要求或提问>"
 ```
 
 ### 方式 2：MCP 函数调用（支持配置了 MCP 服务的 Harness）

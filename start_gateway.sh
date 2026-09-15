@@ -26,12 +26,12 @@ fi
 # ==================== 3. 处理命令行参数 ====================
 if [ "$1" == "--test" ]; then
     echo "🧪 正在执行自动化测试套件..."
-    python3 test_gateway.py
+    python3 tests/test_gateway.py
     exit 0
 fi
 
 # ==================== 4. 注入 Harness 环境变量 ====================
-source "$DIR/harness_env.sh"
+source "$DIR/harness/harness_env.sh"
 
 # ==================== 5. 进程管理与自动清理 ====================
 GATEWAY_PID=""
@@ -63,7 +63,7 @@ echo "==========================================================================
 echo ""
 
 echo "🚀 [1/2] 正在启动 Free Token 聚合网关 (端口 8000)..."
-python3 gateway.py &
+python3 src/gateway.py &
 GATEWAY_PID=$!
 
 # 等待网关服务就绪 (最多 15 秒)

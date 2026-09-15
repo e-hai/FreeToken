@@ -10,7 +10,9 @@ cd "$DIR"
 source ./harness_env.sh
 
 # 2. 激活虚拟环境
-if [ -d ".venv" ]; then
+if [ -d "$DIR/../.venv" ]; then
+    source "$DIR/../.venv/bin/activate"
+elif [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 

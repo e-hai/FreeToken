@@ -9,7 +9,7 @@
 ```bash
 vision "<图片文件路径>" "<你的具体分析要求或提问>"
 ```
-*(备用完整路径：`python3 /Users/a/Develop/project/free-token/vision_mcp.py "<图片文件路径>" "<要求>" `)*
+*(备用完整路径：`python3 tools/vision_mcp.py "<图片文件路径>" "<要求>" `)*
 
 ### 常用典型场景示例：
 
