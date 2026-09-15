@@ -33,3 +33,19 @@ vision "<图片文件路径>" "<你的具体分析要求或提问>"
 ### 协作工作流规范：
 1. **第一步（视觉感知）**：主 Agent 先运行 `vision` 命令或 MCP 工具，网关将自动调度至专属视觉天梯由 Google Gemini 顶级多模态模型深度解析，并返回图像中所有元素的结构化文字描述；
 2. **第二步（逻辑实现）**：主 Agent 根据返回的精准视觉结构与控件细节，发挥强大的代码与架构长项，编写完整、高质量的工程代码。
+
+---
+
+## Chrome DevTools 网页自动化与深度检索规范 (Browser MCP Workflow)
+
+系统已为 Agent 挂载官方 `chrome-devtools-mcp` 插件（工具前缀为 `mcp__chrome__*`），支持自主操控真实 Chrome 浏览器执行复杂检索与网页深度浏览。
+
+### 常用工具与调用步骤：
+1. **导航网页**：使用 `mcp__chrome__navigate_page` 访问目标网址（如 `https://www.bing.com`、`https://www.google.com`、GitHub 或技术文档链接）；
+2. **分析页面元素**：使用 `mcp__chrome__take_snapshot` 获取页面可访问性树及控件 uid；
+3. **交互操作**：使用 `mcp__chrome__fill` 在输入框键入关键词，使用 `mcp__chrome__click` 点击搜索按钮或目标文章；
+4. **正文提取**：使用 `mcp__chrome__evaluate_script` 在页面上下文中执行 JS 获取文本正文或解析动态数据。
+
+### 工具选择策略：
+- **普通查资料 / 简单问答**：优先使用极速轻量的内置 `web_search`；
+- **深度网页阅读 / 动态 JS 渲染页面 / 页面表单交互**：调起 `mcp__chrome__*` 进行完整的浏览器交互。

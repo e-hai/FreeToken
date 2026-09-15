@@ -71,16 +71,18 @@ async def run_tests():
     state.config["providers"].insert(0, {
         "name": "Mock-Primary-Exhausted",
         "enabled": True,
+        "priority": 999,
         "base_url": "http://127.0.0.1:8999/mock-primary",
         "api_key": "mock-key-1",
-        "models": [{"id": "deepseek-v4-pro", "upstream_model": "mock-v4-primary"}]
+        "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-primary"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-primary"}]
     })
     state.config["providers"].insert(1, {
         "name": "Mock-Backup-Active",
         "enabled": True,
+        "priority": 998,
         "base_url": "http://127.0.0.1:8999/mock-backup",
         "api_key": "mock-key-2",
-        "models": [{"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"}]
+        "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-backup"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"}]
     })
     state._init_stats()
 
@@ -158,11 +160,29 @@ async def run_tests():
         full_text = "".join(chunks)
         print(f"✅ 流式 SSE 测试成功！完整接收到流式内容: '{full_text}'")
 
+        # Test 7: Web Search 检索与 Anthropic Messages 协议适配
+        print("\n[Test 7/7] 测试 DeepSeek-Harness 实时 Web 检索与 Anthropic 协议端点...")
+        search_res = await client.post(
+            "/anthropic/v1/messages",
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Perform a web search for the query: Python"}]}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+            }
+        )
+        assert search_res.status_code == 200
+        search_json = search_res.json()
+        assert search_json.get("type") == "message"
+        result_blocks = [b for b in search_json.get("content", []) if b.get("type") == "web_search_tool_result"]
+        assert len(result_blocks) > 0
+        items = result_blocks[0].get("content", [])
+        print(f"✅ Web 检索端点测试成功！成功返回 {len(items)} 条网页索引结果 (首条: {items[0].get('title')[:30]}...)")
+
     server.should_exit = True
     await mock_task
 
     print("\n" + "=" * 70)
-    print("🎉 全球渠道测试全部 100% 通过！网关与多渠道调度容灾完全正常！")
+    print("🎉 全球渠道测试全部 100% 通过！网关调度容灾与实时搜索完全正常！")
     print("=" * 70)
 
 if __name__ == "__main__":

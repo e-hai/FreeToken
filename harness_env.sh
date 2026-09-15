@@ -8,6 +8,11 @@ export OPENAI_API_BASE="http://127.0.0.1:8000/v1"
 export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="free-token"
 
+# 网页搜索 (Web Search) 重定向至本地网关实时免费检索引擎
+export DEEPSEEK_SEARCH_BASE_URL="http://127.0.0.1:8000/anthropic/v1"
+export DEEPSEEK_API_KEY="free-token"
+
 echo "✅ DeepSeek-Harness 环境变量已生效！"
-echo "👉 OPENAI_API_BASE = $OPENAI_API_BASE"
-echo "👉 OPENAI_API_KEY  = $OPENAI_API_KEY"
+echo "👉 OPENAI_API_BASE         = $OPENAI_API_BASE"
+echo "👉 OPENAI_API_KEY          = $OPENAI_API_KEY"
+echo "👉 DEEPSEEK_SEARCH_BASE_URL= $DEEPSEEK_SEARCH_BASE_URL"

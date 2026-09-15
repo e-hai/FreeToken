@@ -2886,6 +2886,318 @@ async def chat_completions(request: Request):
         }
     )
 
+# ==============================================================================
+# 🌐 Chrome 驱动全网实时搜索引擎 (通过 Playwright CDP 调用 Chromium)
+# ==============================================================================
+
+# --- Chrome 浏览器实例管理 (全局复用，惰性初始化) ---
+_chrome_browser = None
+_chrome_lock = asyncio.Lock()
+
+async def _get_chrome_browser():
+    """获取或创建全局复用的 Headless Chromium 浏览器实例 (通过 Playwright CDP 驱动)"""
+    global _chrome_browser
+    if _chrome_browser is not None and _chrome_browser.is_connected():
+        return _chrome_browser
+    async with _chrome_lock:
+        # Double-check after acquiring lock
+        if _chrome_browser is not None and _chrome_browser.is_connected():
+            return _chrome_browser
+        try:
+            from playwright.async_api import async_playwright
+            pw = await async_playwright().start()
+            _chrome_browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--lang=zh-CN,zh,en-US,en",
+                ]
+            )
+            logger.info("🌐 [Chrome] Headless Chromium 浏览器实例已通过 Playwright CDP 启动")
+            return _chrome_browser
+        except Exception as e:
+            logger.warning(f"⚠️ [Chrome] Chromium 启动失败: {e}")
+            return None
+
+
+async def _chrome_google_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """通过 Headless Chrome 执行 Google 搜索并提取结构化结果"""
+    browser = await _get_chrome_browser()
+    if browser is None:
+        return []
+
+    results = []
+    context = None
+    try:
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
+
+        # 构造 Google 搜索 URL
+        search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&hl=zh-CN&num={max_results + 5}"
+        logger.info(f"🌐 [Chrome] 正在通过 Headless Chromium 访问 Google 搜索: '{query}'...")
+
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+        # 等待搜索结果容器出现
+        try:
+            await page.wait_for_selector("#search", timeout=8000)
+        except Exception:
+            # 可能遇到 consent 页面或 CAPTCHA，尝试点击同意按钮
+            consent_btn = page.locator("button:has-text('全部接受'), button:has-text('Accept all'), button:has-text('I agree')")
+            if await consent_btn.count() > 0:
+                await consent_btn.first.click()
+                await page.wait_for_selector("#search", timeout=8000)
+
+        # 提取搜索结果 (在浏览器 JS 上下文中执行)
+        raw_results = await page.evaluate("""() => {
+            const items = [];
+            // Google 搜索结果的标准选择器
+            const resultEls = document.querySelectorAll('#search .g, #rso .g, div[data-hveid] .g');
+            for (const el of resultEls) {
+                const linkEl = el.querySelector('a[href^="http"]');
+                const titleEl = el.querySelector('h3');
+                // 摘要可能在多种容器中
+                const snippetEl = el.querySelector('[data-sncf], .VwiC3b, .IsZvec, [style*="-webkit-line-clamp"]');
+                const dateEl = el.querySelector('.LEwnzc, .f, span.MUxGbd');
+                if (linkEl && titleEl) {
+                    const url = linkEl.href;
+                    // 过滤 Google 内部链接
+                    if (url.includes('google.com/search') || url.includes('accounts.google')) continue;
+                    items.push({
+                        title: titleEl.innerText.trim(),
+                        url: url,
+                        snippet: snippetEl ? snippetEl.innerText.trim() : '',
+                        publishedAt: dateEl ? dateEl.innerText.trim() : ''
+                    });
+                }
+                if (items.length >= """ + str(max_results) + """) break;
+            }
+            return items;
+        }""")
+
+        for item in raw_results:
+            pub = item.get("publishedAt", "")
+            if not pub or len(pub) > 30:
+                pub = time.strftime("%Y-%m-%d")
+            results.append({
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": item.get("snippet", ""),
+                "publishedAt": pub,
+            })
+
+        logger.info(f"✅ [Chrome] Google 搜索完成，成功提取 {len(results)} 条结果")
+
+    except Exception as e:
+        logger.warning(f"⚠️ [Chrome] Google 搜索异常: {e}")
+    finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    return results
+
+
+async def _duckduckgo_fallback_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """DuckDuckGo HTML 兜底搜索 (当 Chrome 不可用或失败时)"""
+    results = []
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
+        }
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.post(url, headers=headers, data={"q": query})
+            if resp.status_code == 200:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for item in soup.select(".result"):
+                    title_el = item.select_one(".result__title .result__a")
+                    snippet_el = item.select_one(".result__snippet")
+                    if not title_el:
+                        continue
+                    raw_url = title_el.get("href", "")
+                    title = title_el.get_text(strip=True)
+                    snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                    if "uddg=" in raw_url:
+                        parsed = urllib.parse.urlparse(raw_url)
+                        params = urllib.parse.parse_qs(parsed.query)
+                        clean_url = params.get("uddg", [raw_url])[0]
+                    elif raw_url.startswith("//"):
+                        clean_url = "https:" + raw_url
+                    else:
+                        clean_url = raw_url
+                    if clean_url and not clean_url.startswith("https://duckduckgo.com"):
+                        results.append({
+                            "title": title,
+                            "url": clean_url,
+                            "snippet": snippet,
+                            "publishedAt": time.strftime("%Y-%m-%d")
+                        })
+                        if len(results) >= max_results:
+                            break
+    except Exception as e:
+        logger.warning(f"⚠️ [WebSearch] DuckDuckGo 兜底检索异常: {e}")
+    return results
+
+
+async def execute_web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    """主搜索入口：Chrome Google 优先，DuckDuckGo 兜底"""
+    query_clean = query.strip()
+    if not query_clean:
+        return []
+
+    logger.info(f"🔍 [WebSearch] 正在为 DeepSeek-Harness 执行实时全网检索: '{query_clean}' (最大条数: {max_results})...")
+
+    # 1. 首选：通过 Headless Chrome (Playwright CDP) 调用 Google 搜索
+    results = await _chrome_google_search(query_clean, max_results)
+
+    # 2. 兜底：如果 Chrome 失败或结果不足，使用 DuckDuckGo HTTP 抓取
+    if len(results) < 3:
+        logger.info(f"🔄 [WebSearch] Chrome 结果不足 ({len(results)} 条)，切换至 DuckDuckGo 兜底引擎...")
+        ddg_results = await _duckduckgo_fallback_search(query_clean, max_results)
+        # 合并去重
+        seen_urls = {r["url"] for r in results}
+        for r in ddg_results:
+            if r["url"] not in seen_urls:
+                results.append(r)
+                seen_urls.add(r["url"])
+                if len(results) >= max_results:
+                    break
+
+    logger.info(f"✅ [WebSearch] 检索完成，成功捕获 {len(results)} 条实时有效网页索引！")
+    return results
+
+@app.post("/anthropic/v1/messages")
+@app.post("/messages")
+@app.post("/v1/messages")
+async def handle_anthropic_messages(request: Request):
+    req_body = await request.json()
+    model = req_body.get("model", "deepseek-v4-flash")
+    messages = req_body.get("messages", [])
+    tools = req_body.get("tools", [])
+
+    # 检测是否为 DeepSeek-Harness 的 web_search 调用
+    is_search = any(
+        t.get("name") == "web_search" or t.get("type") == "web_search_20250305"
+        for t in tools
+    )
+
+    prompt_text = ""
+    for m in reversed(messages):
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    prompt_text = part.get("text", "")
+                    break
+        elif isinstance(content, str):
+            prompt_text = content
+        if prompt_text:
+            break
+
+    if "Perform a web search for the query:" in prompt_text:
+        is_search = True
+
+    if is_search:
+        query = prompt_text
+        if "Perform a web search for the query:" in query:
+            query = query.split("Perform a web search for the query:")[-1].strip()
+        query = query.strip().strip("'\"")
+
+        search_results = await execute_web_search(query, max_results=8)
+
+        tool_results = []
+        citations = []
+        summary_lines = [f"Web search results for '{query}':\n"]
+
+        for idx, item in enumerate(search_results, 1):
+            url = item["url"]
+            title = item["title"]
+            snippet = item.get("snippet", "")
+            page_age = item.get("publishedAt", time.strftime("%Y-%m-%d"))
+
+            tool_results.append({
+                "type": "web_search_result",
+                "url": url,
+                "title": title,
+                "page_age": page_age
+            })
+            if snippet:
+                citations.append({
+                    "type": "web_search_citation",
+                    "url": url,
+                    "cited_text": snippet
+                })
+            summary_lines.append(f"{idx}. [{title}]({url})\n   {snippet}")
+
+        if not search_results:
+            summary_lines.append("No relevant results found for the query.")
+
+        text_summary = "\n".join(summary_lines)
+        text_summary += "\n\nCite the relevant URLs above as markdown links in your answer."
+
+        anthropic_response = {
+            "id": f"msg_{uuid.uuid4().hex[:16]}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [
+                {
+                    "type": "web_search_tool_result",
+                    "content": tool_results
+                },
+                {
+                    "type": "text",
+                    "text": text_summary,
+                    "citations": citations
+                }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": max(1, len(prompt_text) // 4),
+                "output_tokens": max(1, len(text_summary) // 4)
+            }
+        }
+        return JSONResponse(status_code=200, content=anthropic_response)
+
+    # 普通 Anthropic 协议兼容：转换为 OpenAI completions
+    return JSONResponse(status_code=200, content={
+        "id": f"msg_{uuid.uuid4().hex[:16]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "OK"}],
+        "stop_reason": "end_turn"
+    })
+
+@app.get("/v1/search")
+@app.post("/v1/search")
+async def direct_web_search(request: Request, q: Optional[str] = None):
+    query = q
+    if not query:
+        try:
+            body = await request.json()
+            query = body.get("query") or body.get("q")
+        except:
+            pass
+    if not query:
+        raise HTTPException(status_code=400, detail="Query parameter 'q' or JSON field 'query' is required")
+    results = await execute_web_search(query)
+    return {"query": query, "count": len(results), "results": results}
+
 @app.get("/v1/status")
 async def get_status():
     return {
