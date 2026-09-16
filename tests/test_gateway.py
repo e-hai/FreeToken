@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import asyncio
+import copy
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
@@ -79,13 +80,16 @@ async def run_tests():
     print("🧪 开始执行 Global Free Token 网关功能与交互控制测试...")
     print("=" * 70)
 
+    # 0. 备份原始配置，确保测试结束后 100% 还原，不污染 config.yaml
+    original_config = copy.deepcopy(state.config)
+
     # 1. 启动 mock 上游服务器
     config = uvicorn.Config(mock_app, host="127.0.0.1", port=8999, log_level="warning")
     server = uvicorn.Server(config)
     mock_task = asyncio.create_task(server.serve())
     await asyncio.sleep(0.5)
 
-    # 2. 注入模拟渠道到 gateway 配置中
+    # 2. 注入模拟渠道到 gateway 内存配置中 (测试完自动清理)
     state.config["providers"].insert(0, {
         "name": "Mock-Primary-Exhausted",
         "enabled": True,
@@ -103,7 +107,7 @@ async def run_tests():
         "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-backup"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"}]
     })
     state.config["providers"].insert(2, {
-        "name": "Google AI Studio",
+        "name": "Mock-Google-AI-Studio",
         "enabled": True,
         "priority": 997,
         "base_url": "http://127.0.0.1:8999",
@@ -113,7 +117,9 @@ async def run_tests():
     state._init_stats()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver", timeout=15.0) as client:
+    client = httpx.AsyncClient(transport=transport, base_url="http://testserver", timeout=15.0)
+
+    try:
         # Test 1: GET /v1/models
         print("\n[Test 1/6] 测试 GET /v1/models 模型列表聚合接口...")
         res = await client.get("/v1/models")
@@ -130,8 +136,9 @@ async def run_tests():
         assert "switch" in res.text
         print("✅ 交互式网页仪表盘渲染正常！")
 
-        # Test 3: POST /api/providers/toggle 开关测试
-        test_provider_name = state.config["providers"][2]["name"]
+        # Test 3: POST /api/providers/toggle 开关测试 (测试真实生产渠道，验证落盘能力)
+        real_providers = [p for p in state.config["providers"] if not p.get("name", "").startswith("Mock-")]
+        test_provider_name = real_providers[0]["name"]
         print(f"\n[Test 3/6] 测试 POST /api/providers/toggle 渠道开关接口 (目标: {test_provider_name})...")
         res = await client.post("/api/providers/toggle", json={"name": test_provider_name, "enabled": False})
         assert res.status_code == 200
@@ -269,12 +276,16 @@ async def run_tests():
             assert fallback_json["data"][0].get("engine") == "google-imagen-3"
             print(f"✅ Flux 故障自动容灾测试成功！成功无缝切换至: {fallback_json['data'][0].get('engine')}")
 
-    server.should_exit = True
-    await mock_task
-
-    print("\n" + "=" * 70)
-    print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索与 Flux/Imagen-3 自动容灾完全正常！")
-    print("=" * 70)
+        print("\n" + "=" * 70)
+        print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索与 Flux/Imagen-3 自动容灾完全正常！")
+        print("=" * 70)
+    finally:
+        await client.aclose()
+        server.should_exit = True
+        await mock_task
+        # 100% 还原原始内存与磁盘配置，避免 Mock 污染
+        state.config = original_config
+        state.reload_config()
 
 if __name__ == "__main__":
     asyncio.run(run_tests())

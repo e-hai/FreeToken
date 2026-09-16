@@ -8,6 +8,7 @@ import asyncio
 import urllib.parse
 import re
 import uuid
+import copy
 from typing import Dict, List, Any, Optional
 import yaml
 import httpx
@@ -81,8 +82,16 @@ def save_config(config: dict, force_key_updates: Optional[dict] = None):
                 if p_name in existing_enabled:
                     p["enabled"] = existing_enabled[p_name]
 
+    # 彻底过滤临时 Mock/测试提供商，防止测试或调试流量意外落盘污染配置文件
+    clean_providers = [
+        p for p in config.get("providers", [])
+        if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
+    ]
+    dump_cfg = copy.deepcopy(config)
+    dump_cfg["providers"] = clean_providers
+
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(dump_cfg, f, allow_unicode=True, sort_keys=False)
     logger.info("Config saved successfully.")
 
 app = FastAPI(title="Free Token Aggregator Gateway", version="3.0.0")
@@ -133,7 +142,19 @@ class GatewayState:
             self.request_logs.pop()
 
     def reload_config(self):
+        # 保留当前内存中临时注入的 Mock 渠道 (不落盘，仅测试过程有效)
+        mock_providers = [
+            p for p in self.config.get("providers", [])
+            if p.get("name", "").startswith("Mock-") or ":8999" in str(p.get("base_url", ""))
+        ]
         self.config = load_config()
+        if mock_providers:
+            # 重新置顶注入临时 mock providers
+            real_providers = [
+                p for p in self.config.get("providers", [])
+                if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
+            ]
+            self.config["providers"] = mock_providers + real_providers
         self._init_stats()
 
 state = GatewayState()
@@ -1985,13 +2006,7 @@ async def api_delete_provider(req: DeleteProviderRequest):
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
     
     state.config["providers"] = new_providers
-    if os.path.exists(CONFIG_PATH):
-        try:
-            shutil.copy2(CONFIG_PATH, f"{CONFIG_PATH}.bak")
-        except Exception:
-            pass
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.safe_dump(state.config, f, allow_unicode=True, sort_keys=False)
+    save_config(state.config)
     state.reload_config()
     return {"status": "ok", "deleted": req.name}
 
