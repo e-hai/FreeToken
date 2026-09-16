@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import shutil
 import logging
 import asyncio
@@ -11,7 +12,7 @@ from typing import Dict, List, Any, Optional
 import yaml
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Response
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -35,6 +36,9 @@ def _resolve_config_path() -> str:
     return root_config
 
 CONFIG_PATH = _resolve_config_path()
+
+GENERATED_IMAGES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static", "generated_images")
+os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
@@ -1267,6 +1271,92 @@ async def dashboard():
                             <strong>多模态视觉分析天梯：</strong>专供 Google Gemini 3.8 / 3.6 / 3.5 Flash 顶级视觉模型，用于 UI 还原、组件布局提取、报错截屏 OCR、设计稿审查，与编程 Agent 完美解耦。
                         </div>
                     </div>
+                    <div class="model-card" style="border-color: rgba(168, 85, 247, 0.4); background: rgba(168, 85, 247, 0.04);">
+                        <div class="model-card-top">
+                            <div class="model-card-id" style="color: #c084fc;">🎨 flux / image-gen (文生图专属)</div>
+                            <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">/v1/images/generations · 免Key</span>
+                        </div>
+                        <div class="model-card-desc">
+                            <strong>AI 文生图引擎：</strong>兼容 OpenAI 标准图像生成协议，默认搭载 Flux / SDXL 免费高质量生图大模型，支持任意比例、本地落盘托管与多端渲染。
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 🎨 AI 文生图实验室 (Image Studio) -->
+            <div class="card" style="border: 1px solid rgba(168, 85, 247, 0.3); background: rgba(20, 16, 30, 0.6); margin-bottom: 24px;">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="svg-icon" style="color:#c084fc;">
+                            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                        </span>
+                        <span>AI Image Studio · 文生图实验室</span>
+                        <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">
+                            Flux + Imagen 3 双引擎容灾
+                        </span>
+                    </div>
+                </div>
+                <div style="padding: 16px 20px; display: flex; flex-direction: column; gap: 14px;">
+                    <div style="display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;">
+                        <div style="flex: 1; min-width: 280px;">
+                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">输入画面描述 (Prompt，支持中英文)：</label>
+                            <textarea id="image-prompt" rows="2" style="width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 13px; font-family: inherit; resize: vertical;" placeholder="例如：一只赛博朋克风格的机械猫在霓虹街道漫步，电影级光影，8k壁纸"></textarea>
+                        </div>
+                        <div style="width: 170px;">
+                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">图像尺寸 / 比例</label>
+                            <select id="image-size" style="width: 100%; background: #161822; border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 13px;">
+                                <option value="1024x1024">1:1 方形 (1024x1024)</option>
+                                <option value="1280x720">16:9 横屏 (1280x720)</option>
+                                <option value="720x1280">9:16 竖屏 (720x1280)</option>
+                                <option value="512x512">1:1 极速 (512x512)</option>
+                            </select>
+                        </div>
+                        <div style="width: 160px;">
+                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">模型架构</label>
+                            <select id="image-model" style="width: 100%; background: #161822; border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 13px;">
+                                <option value="auto">Auto (Flux优先 · Imagen 3容灾)</option>
+                                <option value="flux">FLUX.1 (免Key开源旗舰)</option>
+                                <option value="imagen-3">Google Imagen 3 (官方精细画质)</option>
+                                <option value="turbo">Turbo (极速秒级)</option>
+                            </select>
+                        </div>
+                        <div style="align-self: flex-end;">
+                            <button id="btn-generate-image" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600; background: linear-gradient(135deg, #a855f7 0%, #6366f1 100%);" onclick="generateImageFromStudio()">
+                                <span>🎨 开始生成</span>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div id="image-loading" style="display: none; padding: 20px; text-align: center; color: var(--text-secondary); font-size: 13px;">
+                        <span class="pulse-dot" style="display: inline-block; margin-right: 6px;"></span>
+                        正在调度扩散模型生成画面 (Flux 优先 · Imagen 3 智能容灾)，请稍候约 3~6 秒...
+                    </div>
+
+                    <div id="image-result-box" style="display: none; padding-top: 10px; border-top: 1px solid var(--border-subtle);">
+                        <div style="display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;">
+                            <div style="position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-card); max-width: 480px;">
+                                <img id="image-result-preview" src="" alt="生成结果" style="display: block; max-width: 100%; height: auto; border-radius: 8px;">
+                            </div>
+                            <div style="flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 10px;">
+                                <div style="font-size: 13px; color: var(--text-secondary);">
+                                    <strong style="color: #fff;">提示词：</strong><span id="image-result-prompt"></span>
+                                </div>
+                                <div style="font-size: 12px; color: var(--text-tertiary); display: flex; align-items: center; gap: 8px;">
+                                    <strong>渲染引擎：</strong>
+                                    <span id="image-result-engine" class="badge" style="background:rgba(168, 85, 247, 0.2);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.4);">flux</span>
+                                </div>
+                                <div style="font-size: 12px; color: var(--text-tertiary);">
+                                    <strong>本地托管链接：</strong><br>
+                                    <a id="image-result-link" href="#" target="_blank" style="color: var(--accent-cyan); word-break: break-all;"></a>
+                                </div>
+                                <div style="display: flex; gap: 10px; margin-top: 8px;">
+                                    <a id="image-download-btn" href="#" download="generated_image.jpg" class="btn" style="font-size: 12px; padding: 6px 14px;">
+                                        <span>💾 下载图片</span>
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -1768,6 +1858,65 @@ async def dashboard():
                         loadLogs();
                     }}
                 }} catch (e) {{}}
+            }}
+
+            async function generateImageFromStudio() {{
+                const prompt = document.getElementById("image-prompt").value.trim();
+                if (!prompt) {{
+                    showToast("请输入画面描述提示词", "error");
+                    return;
+                }}
+                const size = document.getElementById("image-size").value;
+                const model = document.getElementById("image-model").value;
+                const btn = document.getElementById("btn-generate-image");
+                const loading = document.getElementById("image-loading");
+                const resultBox = document.getElementById("image-result-box");
+
+                btn.disabled = true;
+                btn.style.opacity = "0.6";
+                loading.style.display = "block";
+                resultBox.style.display = "none";
+
+                try {{
+                    const res = await fetch("/v1/images/generations", {{
+                        method: "POST",
+                        headers: {{ "Content-Type": "application/json" }},
+                        body: JSON.stringify({{ prompt, size, model, n: 1 }})
+                    }});
+                    const data = await res.json();
+                    if (!res.ok) {{
+                        throw new Error(data.detail || "生成失败");
+                    }}
+                    const imgUrl = data.data[0].url;
+                    const engineUsed = data.data[0].engine || "flux";
+                    document.getElementById("image-result-preview").src = imgUrl;
+                    document.getElementById("image-result-prompt").innerText = prompt;
+                    const engineEl = document.getElementById("image-result-engine");
+                    if (engineEl) {{
+                        engineEl.innerText = engineUsed.toUpperCase();
+                        if (engineUsed.includes("imagen")) {{
+                            engineEl.style.background = "rgba(59, 130, 246, 0.2)";
+                            engineEl.style.color = "#60a5fa";
+                            engineEl.style.borderColor = "rgba(59, 130, 246, 0.4)";
+                        }} else {{
+                            engineEl.style.background = "rgba(168, 85, 247, 0.2)";
+                            engineEl.style.color = "#c084fc";
+                            engineEl.style.borderColor = "rgba(168, 85, 247, 0.4)";
+                        }}
+                    }}
+                    const linkEl = document.getElementById("image-result-link");
+                    linkEl.href = imgUrl;
+                    linkEl.innerText = imgUrl;
+                    document.getElementById("image-download-btn").href = imgUrl;
+                    resultBox.style.display = "block";
+                    showToast("✨ 图像生成成功 (" + engineUsed + ")！", "success");
+                }} catch (err) {{
+                    showToast("❌ 图像生成失败: " + err.message, "error");
+                }} finally {{
+                    btn.disabled = false;
+                    btn.style.opacity = "1";
+                    loading.style.display = "none";
+                }}
             }}
 
             renderTable();
@@ -3208,7 +3357,246 @@ async def direct_web_search(request: Request, q: Optional[str] = None):
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter 'q' or JSON field 'query' is required")
     results = await execute_web_search(query)
-    return {"query": query, "count": len(results), "results": results}
+# ==============================================================================
+# 🎨 免费 AI 图像生成引擎与 OpenAI 图像生成协议适配 (/v1/images/generations)
+# 支持双引擎智能容灾调度：FLUX.1 (开源免Key优先) + Google Imagen 3 (官方高质量兜底)
+# ==============================================================================
+def get_google_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
+    """获取可用的 Google API Key (请求头参数 > 环境变量 > 配置渠道)"""
+    if explicit_key and not explicit_key.startswith("YOUR_"):
+        return explicit_key.strip()
+    for env_var in ["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_STUDIO_KEY"]:
+        val = os.environ.get(env_var, "").strip()
+        if val and not val.startswith("YOUR_"):
+            return val
+    for p in state.config.get("providers", []):
+        p_name = p.get("name", "").lower()
+        if "google" in p_name:
+            key = (p.get("api_key") or "").strip()
+            if key and not key.startswith("YOUR_"):
+                return key
+    return None
+
+def get_imagen_aspect_ratio(width: int, height: int) -> str:
+    """根据宽高映射为 Google Imagen 3 支持的标准宽高比 (1:1, 16:9, 9:16, 4:3, 3:4)"""
+    if width == height:
+        return "1:1"
+    ratio = width / height
+    if ratio > 1.0:
+        return "16:9" if ratio >= 1.5 else "4:3"
+    else:
+        inv_ratio = height / width
+        return "9:16" if inv_ratio >= 1.5 else "3:4"
+
+async def generate_with_google_imagen(
+    prompt: str,
+    aspect_ratio: str = "1:1",
+    api_key: Optional[str] = None
+) -> Optional[bytes]:
+    """通过 Google AI Studio 官方 Imagen 3 扩散模型生成图像"""
+    key = get_google_api_key(api_key)
+    if not key:
+        logger.info("ℹ️ [ImageGen/Imagen3] 未检测到有效的 Google API Key，跳过 Imagen 3 容灾")
+        return None
+
+    # 获取 Google AI Studio 自定义 Base URL (若存在代理或测试服务器)
+    base_endpoint = "https://generativelanguage.googleapis.com"
+    for p in state.config.get("providers", []):
+        if "google" in p.get("name", "").lower():
+            p_base = (p.get("base_url") or "").rstrip("/")
+            if p_base and "generativelanguage.googleapis.com" not in p_base:
+                base_endpoint = p_base
+                break
+
+    models_to_try = [
+        "imagen-3.0-generate-002",
+        "imagen-3.0-fast-generate-001"
+    ]
+    
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key
+    }
+    payload = {
+        "instances": [
+            {"prompt": prompt}
+        ],
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": aspect_ratio,
+            "personGeneration": "ALLOW_ADULT",
+            "outputMimeType": "image/jpeg"
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for m_id in models_to_try:
+            url = f"{base_endpoint}/v1beta/models/{m_id}:predict"
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    preds = data.get("predictions", [])
+                    if preds and "bytesBase64Encoded" in preds[0]:
+                        logger.info(f"✨ [ImageGen/Imagen3] 成功使用 Google Imagen 3 ({m_id}) 生成图像！")
+                        return base64.b64decode(preds[0]["bytesBase64Encoded"])
+                logger.warning(f"⚠️ [ImageGen/Imagen3] {m_id} 响应状态码: {resp.status_code}, 内容: {resp.text[:150]}")
+            except Exception as e:
+                logger.warning(f"⚠️ [ImageGen/Imagen3] 网络调用异常 ({m_id}): {e}")
+    return None
+
+async def execute_image_generation(
+    prompt: str,
+    size: str = "1024x1024",
+    model: str = "flux",
+    n: int = 1,
+    response_format: str = "url",
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    prompt_clean = prompt.strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    width, height = 1024, 1024
+    if size and "x" in size:
+        try:
+            parts = size.lower().split("x")
+            width, height = int(parts[0]), int(parts[1])
+            width = max(256, min(2048, width))
+            height = max(256, min(2048, height))
+        except Exception:
+            width, height = 1024, 1024
+
+    aspect_ratio = get_imagen_aspect_ratio(width, height)
+    m_lower = (model or "flux").lower()
+    prefer_imagen = ("imagen" in m_lower or "google" in m_lower)
+    target_flux_model = "turbo" if "turbo" in m_lower else "flux"
+
+    logger.info(f"🎨 [ImageGen] 正在生成图像: '{prompt_clean[:60]}...' (尺寸: {width}x{height}, 比例: {aspect_ratio}, 模型: {model}, 数量: {n})")
+
+    data_items = []
+    max_count = max(1, min(4, int(n or 1)))
+
+    for i in range(max_count):
+        seed = int(time.time() * 1000) % 1000000 + i * 37
+        encoded_prompt = urllib.parse.quote(prompt_clean)
+        
+        img_bytes = None
+        engine_used = None
+
+        # 1. 若显式指定 Imagen 3，优先尝试 Imagen 3
+        if prefer_imagen:
+            img_bytes = await generate_with_google_imagen(prompt_clean, aspect_ratio=aspect_ratio, api_key=api_key)
+            if img_bytes:
+                engine_used = "google-imagen-3"
+            else:
+                logger.warning("⚠️ [ImageGen] Google Imagen 3 引擎出图失败，降级至 Flux 开源引擎...")
+
+        # 2. 尝试 Flux 引擎 (开源免Key)
+        if not img_bytes:
+            urls_to_try = [
+                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&model={target_flux_model}&nologo=true&seed={seed}",
+                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&model=turbo&nologo=true&seed={seed}"
+            ]
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                for candidate_url in urls_to_try:
+                    try:
+                        resp = await client.get(candidate_url)
+                        if resp.status_code == 200 and len(resp.content) > 1024:
+                            img_bytes = resp.content
+                            engine_used = f"flux-{target_flux_model}"
+                            break
+                        else:
+                            logger.warning(f"⚠️ [ImageGen] Flux 候选端点响应状态码: {resp.status_code}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ [ImageGen] Flux 图像生成网络异常: {e}")
+
+        # 3. 若 Flux 失败且之前未尝试过 Imagen 3，则自动触发 Google Imagen 3 容灾切换！
+        if not img_bytes and not prefer_imagen:
+            logger.warning("⚠️ [ImageGen] Flux 免费通道请求失败或超时，自动容灾切换至 Google Imagen 3 引擎...")
+            img_bytes = await generate_with_google_imagen(prompt_clean, aspect_ratio=aspect_ratio, api_key=api_key)
+            if img_bytes:
+                engine_used = "google-imagen-3"
+
+        if not img_bytes:
+            raise HTTPException(
+                status_code=502,
+                detail="Image generation failed on both Flux and Google Imagen 3 tiers. Please check network connectivity or Google API Key."
+            )
+
+        file_id = f"img_{uuid.uuid4().hex[:12]}.jpg"
+        file_path = os.path.join(GENERATED_IMAGES_DIR, file_id)
+        with open(file_path, "wb") as f:
+            f.write(img_bytes)
+
+        local_url = f"/generated_images/{file_id}"
+
+        item = {
+            "revised_prompt": prompt_clean,
+            "engine": engine_used
+        }
+        if response_format == "b64_json":
+            item["b64_json"] = base64.b64encode(img_bytes).decode("utf-8")
+        else:
+            item["url"] = local_url
+
+        data_items.append(item)
+
+    return {
+        "created": int(time.time()),
+        "data": data_items
+    }
+
+@app.get("/generated_images/{filename}")
+async def get_generated_image(filename: str):
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(GENERATED_IMAGES_DIR, safe_filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(file_path, media_type="image/jpeg")
+
+@app.post("/v1/images/generations")
+@app.post("/images/generations")
+async def create_image_generation(request: Request):
+    try:
+        req_body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    prompt = req_body.get("prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing required parameter 'prompt'")
+
+    size = req_body.get("size", "1024x1024")
+    model = req_body.get("model", "auto")
+    n = req_body.get("n", 1)
+    response_format = req_body.get("response_format", "url")
+
+    # 提取请求头可能附带的 Google / 自定义 API Key
+    custom_key = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.replace("Bearer ", "").strip()
+        if token and not token.startswith("sk-free-"):
+            custom_key = token
+    if not custom_key:
+        custom_key = request.headers.get("x-goog-api-key") or request.headers.get("x-api-key")
+
+    result = await execute_image_generation(
+        prompt=prompt,
+        size=size,
+        model=model,
+        n=n,
+        response_format=response_format,
+        api_key=custom_key
+    )
+
+    base_url_str = str(request.base_url).rstrip("/")
+    for item in result.get("data", []):
+        if "url" in item and item["url"].startswith("/"):
+            item["url"] = f"{base_url_str}{item['url']}"
+
+    return JSONResponse(status_code=200, content=result)
 
 @app.get("/v1/status")
 async def get_status():

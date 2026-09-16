@@ -17,6 +17,8 @@ env/
 *.tmp
 *.log
 deepseek_v4_test_result.json
+static/generated_images/*
+!static/generated_images/.gitkeep
 
 # OS & IDE
 .DS_Store

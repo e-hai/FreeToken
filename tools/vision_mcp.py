@@ -84,6 +84,42 @@ def analyze_image(image_path: str, prompt: str = "请详细描述此图片中的
                 continue
             return f"❌ 视觉请求出现异常: {str(last_err)}"
 
+def generate_image_call(prompt: str, size: str = "1024x1024", model: str = "flux", output_path: str = None) -> str:
+    """调用本地网关或云端生成图像并落盘"""
+    import time
+    try:
+        payload = {"prompt": prompt, "size": size, "model": model, "n": 1, "response_format": "url"}
+        gateway_endpoint = GATEWAY_URL.replace("/chat/completions", "/images/generations")
+        req = urllib.request.Request(
+            gateway_endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=60.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            img_url = data["data"][0]["url"]
+            if not output_path:
+                output_path = os.path.abspath(f"generated_image_{int(time.time())}.jpg")
+            urllib.request.urlretrieve(img_url, output_path)
+            return f"✅ 图像生成成功！\n- 本地保存路径: {output_path}\n- 网页预览链接: {img_url}\n- Markdown: ![Generated Image](file://{output_path})"
+    except Exception as e:
+        try:
+            width, height = 1024, 1024
+            if size and "x" in size:
+                parts = size.lower().split("x")
+                width, height = int(parts[0]), int(parts[1])
+            encoded = urllib.parse.quote(prompt.strip())
+            direct_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&model={model}&nologo=true&seed={int(time.time()*1000)%1000000}"
+            if not output_path:
+                output_path = os.path.abspath(f"generated_image_{int(time.time())}.jpg")
+            req = urllib.request.Request(direct_url, headers={"User-Agent": "Mozilla/5.0 (FreeToken MCP)"})
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
+                with open(output_path, "wb") as f:
+                    f.write(resp.read())
+            return f"✅ 图像生成成功 (云端极速引擎)！\n- 本地保存路径: {output_path}\n- 原始图片链接: {direct_url}\n- Markdown: ![Generated Image](file://{output_path})"
+        except Exception as direct_err:
+            return f"❌ 图像生成失败: {direct_err}"
+
 def run_mcp_server():
     """以标准 JSON-RPC 2.0 stdio 模式运行 MCP 服务"""
     for line in sys.stdin:
@@ -143,6 +179,28 @@ def run_mcp_server():
                                 },
                                 "required": ["image_path"]
                             }
+                        },
+                        {
+                            "name": "generate_image",
+                            "description": "AI 图像生成工具（画图外挂）：根据提示词渲染生成高质量图像、插画、设计稿、配图并自动保存在本地，返回本地文件路径与 Markdown 嵌入链接。",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "生成画面的详细描述 (中英文均可，可包含主体、风格、光影、构图等细节)"
+                                    },
+                                    "size": {
+                                        "type": "string",
+                                        "description": "图像尺寸，如 '1024x1024' (1:1), '1280x720' (16:9), '720x1280' (9:16)。默认 '1024x1024'"
+                                    },
+                                    "output_path": {
+                                        "type": "string",
+                                        "description": "图像保存的本地文件路径（可选，默认为当前目录）"
+                                    }
+                                },
+                                "required": ["prompt"]
+                            }
                         }
                     ]
                 }
@@ -157,6 +215,23 @@ def run_mcp_server():
                 img_path = args.get("image_path", "")
                 p_text = args.get("prompt", "请详细描述此图片中的所有视觉内容、文字与布局结构：")
                 result_text = analyze_image(img_path, p_text)
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": result_text
+                            }
+                        ]
+                    }
+                }
+            elif tool_name == "generate_image":
+                p_text = args.get("prompt", "")
+                sz = args.get("size", "1024x1024")
+                out_p = args.get("output_path")
+                result_text = generate_image_call(p_text, size=sz, output_path=out_p)
                 res = {
                     "jsonrpc": "2.0",
                     "id": req_id,

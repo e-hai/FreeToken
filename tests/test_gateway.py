@@ -59,6 +59,21 @@ async def mock_backup(request: Request):
             "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
         })
 
+@mock_app.post("/v1beta/models/imagen-3.0-generate-002:predict")
+@mock_app.post("/v1beta/models/imagen-3.0-fast-generate-001:predict")
+async def mock_imagen(request: Request):
+    mock_call_counts["imagen"] = mock_call_counts.get("imagen", 0) + 1
+    # 1x1 base64 transparent png (valid image)
+    dummy_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    return JSONResponse({
+        "predictions": [
+            {
+                "bytesBase64Encoded": dummy_b64,
+                "mimeType": "image/png"
+            }
+        ]
+    })
+
 async def run_tests():
     print("=" * 70)
     print("🧪 开始执行 Global Free Token 网关功能与交互控制测试...")
@@ -86,6 +101,14 @@ async def run_tests():
         "base_url": "http://127.0.0.1:8999/mock-backup",
         "api_key": "mock-key-2",
         "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-backup"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"}]
+    })
+    state.config["providers"].insert(2, {
+        "name": "Google AI Studio",
+        "enabled": True,
+        "priority": 997,
+        "base_url": "http://127.0.0.1:8999",
+        "api_key": "mock-google-key",
+        "models": [{"id": "imagen-3.0-generate-002", "upstream_model": "imagen-3.0-generate-002"}]
     })
     state._init_stats()
 
@@ -181,11 +204,76 @@ async def run_tests():
         items = result_blocks[0].get("content", [])
         print(f"✅ Web 检索端点测试成功！成功返回 {len(items)} 条网页索引结果 (首条: {items[0].get('title')[:30]}...)")
 
+        # Test 8: AI 文生图接口 (/v1/images/generations)
+        print("\n[Test 8/9] 测试 AI 文生图接口与本地落盘托管 (/v1/images/generations)...")
+        img_res = await client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A cute origami bird",
+                "size": "512x512",
+                "model": "flux",
+                "n": 1
+            }
+        )
+        assert img_res.status_code == 200
+        img_json = img_res.json()
+        assert "data" in img_json and len(img_json["data"]) > 0
+        img_url = img_json["data"][0]["url"]
+        assert img_url is not None
+        print(f"✅ 文生图端点测试成功！返回图像 URL: {img_url}")
+
+        # 测试本地静态图片获取
+        if "/generated_images/" in img_url:
+            path_part = "/generated_images/" + img_url.split("/generated_images/")[-1]
+            static_res = await client.get(path_part)
+            assert static_res.status_code == 200
+            assert len(static_res.content) > 50
+            print(f"✅ 本地静态图片托管验证通过！图片字节大小: {len(static_res.content)} bytes")
+
+        # Test 9: 测试 Google Imagen 3 引擎调度
+        print("\n[Test 9/10] 测试 Google Imagen 3 官方扩散引擎调度...")
+        imagen_res = await client.post(
+            "/v1/images/generations",
+            headers={"x-goog-api-key": "mock-google-key"},
+            json={
+                "prompt": "A futuristic metropolis with flying cars, photorealistic 8k",
+                "size": "1024x1024",
+                "model": "imagen-3",
+                "n": 1
+            }
+        )
+        assert imagen_res.status_code == 200
+        imagen_json = imagen_res.json()
+        assert len(imagen_json["data"]) > 0
+        assert imagen_json["data"][0].get("engine") == "google-imagen-3"
+        assert mock_call_counts.get("imagen", 0) >= 1
+        print(f"✅ Google Imagen 3 引擎调用成功！(引擎标识: {imagen_json['data'][0].get('engine')}, 调用计数: {mock_call_counts.get('imagen')})")
+
+        # Test 10: 测试 Flux 故障时自动无缝容灾切换至 Google Imagen 3
+        print("\n[Test 10/10] 测试 Flux 故障时自动容灾切换至 Google Imagen 3...")
+        import unittest.mock
+        with unittest.mock.patch("httpx.AsyncClient.get", side_effect=Exception("Pollinations Network Down")):
+            fallback_res = await client.post(
+                "/v1/images/generations",
+                headers={"x-goog-api-key": "mock-google-key"},
+                json={
+                    "prompt": "Cyberpunk robot in neon rain",
+                    "size": "1024x1024",
+                    "model": "flux",
+                    "n": 1
+                }
+            )
+            assert fallback_res.status_code == 200
+            fallback_json = fallback_res.json()
+            assert len(fallback_json["data"]) > 0
+            assert fallback_json["data"][0].get("engine") == "google-imagen-3"
+            print(f"✅ Flux 故障自动容灾测试成功！成功无缝切换至: {fallback_json['data'][0].get('engine')}")
+
     server.should_exit = True
     await mock_task
 
     print("\n" + "=" * 70)
-    print("🎉 全球渠道测试全部 100% 通过！网关调度容灾与实时搜索完全正常！")
+    print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索与 Flux/Imagen-3 自动容灾完全正常！")
     print("=" * 70)
 
 if __name__ == "__main__":
