@@ -1313,15 +1313,15 @@ async def dashboard():
             </div>
 
             <!-- 🎨 AI 文生图实验室 (Image Studio) -->
-            <div class="card" style="border: 1px solid rgba(168, 85, 247, 0.3); background: rgba(20, 16, 30, 0.6); margin-bottom: 24px;">
+            <div class="card" style="border: 1px solid rgba(59, 130, 246, 0.3); background: rgba(16, 20, 30, 0.6); margin-bottom: 24px;">
                 <div class="card-header">
                     <div class="card-title">
-                        <span class="svg-icon" style="color:#c084fc;">
+                        <span class="svg-icon" style="color:#60a5fa;">
                             <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
                         </span>
                         <span>AI Image Studio · 文生图实验室</span>
-                        <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">
-                            Flux + Imagen 3 双引擎容灾
+                        <span class="badge" style="background:rgba(59, 130, 246, 0.15);color:#60a5fa;border:1px solid rgba(59, 130, 246, 0.3);">
+                            Google Imagen 3 官方引擎 (100% 零水印)
                         </span>
                     </div>
                 </div>
@@ -1329,7 +1329,7 @@ async def dashboard():
                     <div style="display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;">
                         <div style="flex: 1; min-width: 280px;">
                             <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">输入画面描述 (Prompt，支持中英文)：</label>
-                            <textarea id="image-prompt" rows="2" style="width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 13px; font-family: inherit; resize: vertical;" placeholder="例如：一只赛博朋克风格的机械猫在霓虹街道漫步，电影级光影，8k壁纸"></textarea>
+                            <textarea id="image-prompt" rows="2" style="width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 13px; font-family: inherit; resize: vertical;" placeholder="例如：一只可爱的柴犬在阳光草坪上奔跑，真实摄影，8k画质"></textarea>
                         </div>
                         <div style="width: 170px;">
                             <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">图像尺寸 / 比例</label>
@@ -1337,20 +1337,19 @@ async def dashboard():
                                 <option value="1024x1024">1:1 方形 (1024x1024)</option>
                                 <option value="1280x720">16:9 横屏 (1280x720)</option>
                                 <option value="720x1280">9:16 竖屏 (720x1280)</option>
-                                <option value="512x512">1:1 极速 (512x512)</option>
+                                <option value="1024x768">4:3 经典 (1024x768)</option>
+                                <option value="768x1024">3:4 人像 (768x1024)</option>
                             </select>
                         </div>
-                        <div style="width: 160px;">
-                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">模型架构</label>
+                        <div style="width: 210px;">
+                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">扩散模型架构</label>
                             <select id="image-model" style="width: 100%; background: #161822; border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 13px;">
-                                <option value="auto">Auto (Flux优先 · Imagen 3容灾)</option>
-                                <option value="flux">FLUX.1 (免Key开源旗舰)</option>
-                                <option value="imagen-3">Google Imagen 3 (官方精细画质)</option>
-                                <option value="turbo">Turbo (极速秒级)</option>
+                                <option value="imagen-3">Google Imagen 3 (官方高质量旗舰 · 0水印)</option>
+                                <option value="imagen-3.0-fast-generate-001">Google Imagen 3 Fast (极速扩散 · 0水印)</option>
                             </select>
                         </div>
                         <div style="align-self: flex-end;">
-                            <button id="btn-generate-image" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600; background: linear-gradient(135deg, #a855f7 0%, #6366f1 100%);" onclick="generateImageFromStudio()">
+                            <button id="btn-generate-image" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600; background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);" onclick="generateImageFromStudio()">
                                 <span>🎨 开始生成</span>
                             </button>
                         </div>
@@ -1358,7 +1357,7 @@ async def dashboard():
                     
                     <div id="image-loading" style="display: none; padding: 20px; text-align: center; color: var(--text-secondary); font-size: 13px;">
                         <span class="pulse-dot" style="display: inline-block; margin-right: 6px;"></span>
-                        正在调度扩散模型生成画面 (Flux 优先 · Imagen 3 智能容灾)，请稍候约 3~6 秒...
+                        正在调度 Google Imagen 3 官方扩散模型生成高清画面，请稍候约 3~6 秒...
                     </div>
 
                     <div id="image-result-box" style="display: none; padding-top: 10px; border-top: 1px solid var(--border-subtle);">
@@ -2565,7 +2564,7 @@ async def chat_completions(request: Request):
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
-                    initial_header_timeout = 15.0 if "nvidia" in base_url.lower() else 18.0
+                    initial_header_timeout = 8.0 if "nvidia" in base_url.lower() else 12.0
                     try:
                         response = await asyncio.wait_for(client.send(req, stream=True), timeout=initial_header_timeout)
                     except Exception as header_err:
@@ -3379,12 +3378,21 @@ async def handle_openai_responses(request: Request):
         req_body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-
     model = req_body.get("model", "auto")
     instructions = req_body.get("instructions")
     raw_input = req_body.get("input", [])
     raw_tools = req_body.get("tools", [])
-    is_stream = req_body.get("stream", False)
+    
+    accept_header = request.headers.get("accept", "")
+    stream_param = req_body.get("stream")
+    if stream_param is not None:
+        is_stream = bool(stream_param)
+    elif "text/event-stream" in accept_header:
+        is_stream = True
+    else:
+        is_stream = True  # Responses API 默认流式 SSE
+
+    logger.info(f"👉 [Responses API Request]: model={model}, is_stream={is_stream}, accept={accept_header}")
 
     converted_messages = []
     if instructions and isinstance(instructions, str):
@@ -3438,10 +3446,24 @@ async def handle_openai_responses(request: Request):
                 else:
                     converted_messages.append({"role": "user", "content": json.dumps(item)})
 
+    # 严格清洗 messages，移除 Codex 内部私有字段 (如 reasoning_details, encrypted_content 等)
+    clean_messages = []
+    for m in converted_messages:
+        role = m.get("role", "user")
+        clean_m = {"role": role}
+        if "content" in m:
+            clean_m["content"] = m["content"]
+        if role == "assistant" and "tool_calls" in m:
+            clean_m["tool_calls"] = m["tool_calls"]
+        if role == "tool" and "tool_call_id" in m:
+            clean_m["tool_call_id"] = m["tool_call_id"]
+        clean_messages.append(clean_m)
+
     converted_tools = []
     for t in raw_tools:
         if isinstance(t, dict):
-            if t.get("type") == "function":
+            t_type = t.get("type")
+            if t_type == "function":
                 if "function" in t:
                     converted_tools.append(t)
                 elif "name" in t:
@@ -3453,12 +3475,20 @@ async def handle_openai_responses(request: Request):
                             "parameters": t.get("parameters", {})
                         }
                     })
-            else:
-                converted_tools.append(t)
+            elif t.get("name"):
+                # 兼容 Codex 内部的非 function 专属工具定义，规范化为标准 OpenAI Function
+                converted_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name"),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("parameters") or t.get("inputSchema", {})
+                    }
+                })
 
     chat_payload = {
         "model": model,
-        "messages": converted_messages,
+        "messages": clean_messages,
         "stream": is_stream
     }
     if converted_tools:
@@ -3525,19 +3555,6 @@ async def handle_openai_responses(request: Request):
         return JSONResponse(status_code=200, content=responses_data)
 
     # 2. 流式处理 (stream: true) -> 转换为 Responses API SSE 规范事件流
-    transport = httpx.ASGITransport(app=app)
-    internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0)
-    req = internal_client.build_request("POST", "/v1/chat/completions", json=chat_payload, headers=headers)
-    upstream_res = await internal_client.send(req, stream=True)
-
-    if upstream_res.status_code != 200:
-        err_content = await upstream_res.aread()
-        await internal_client.aclose()
-        try:
-            return JSONResponse(status_code=upstream_res.status_code, content=json.loads(err_content))
-        except:
-            return Response(status_code=upstream_res.status_code, content=err_content)
-
     async def stream_responses_generator():
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         created_at = int(time.time())
@@ -3548,17 +3565,49 @@ async def handle_openai_responses(request: Request):
         tool_calls_map = {}
         final_model = model
 
-        # 发射 response.created
+        # 立即发射 response.created，0ms 握手防客户端超时
         created_event = {
-            "id": resp_id,
-            "object": "response",
-            "status": "in_progress",
-            "model": model,
-            "created_at": created_at
+            "type": "response.created",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": model,
+                "created_at": created_at
+            }
         }
         yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
 
+        transport = httpx.ASGITransport(app=app)
+        internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0)
+        req = internal_client.build_request("POST", "/v1/chat/completions", json=chat_payload, headers=headers)
+        upstream_res = None
         try:
+            send_task = asyncio.create_task(internal_client.send(req, stream=True))
+            while not send_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(send_task), timeout=1.2)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+            upstream_res = await send_task
+            if upstream_res.status_code != 200:
+                err_content = await upstream_res.aread()
+                err_str = err_content.decode("utf-8", errors="ignore")
+                logger.error(f"❌ [Responses API Streaming] 内部上游返回错误 HTTP {upstream_res.status_code}: {err_str}")
+                err_event = {
+                    "type": "response.failed",
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "failed",
+                        "error": {
+                            "message": f"Upstream error HTTP {upstream_res.status_code}: {err_str[:200]}"
+                        }
+                    }
+                }
+                yield f"event: response.failed\ndata: {json.dumps(err_event)}\n\n"
+                return
+
             async for line in upstream_res.aiter_lines():
                 line_str = line.strip()
                 if not line_str or line_str.startswith(":"):
@@ -3588,7 +3637,7 @@ async def handle_openai_responses(request: Request):
                     if not msg_started:
                         msg_started = True
                         item_added = {
-                            "id": resp_id,
+                            "type": "response.output_item.added",
                             "output_index": output_index,
                             "item": {
                                 "id": msg_id,
@@ -3600,7 +3649,7 @@ async def handle_openai_responses(request: Request):
                         }
                         yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
                         part_added = {
-                            "id": resp_id,
+                            "type": "response.content_part.added",
                             "output_index": output_index,
                             "content_index": 0,
                             "part": {"type": "output_text", "text": ""}
@@ -3609,7 +3658,7 @@ async def handle_openai_responses(request: Request):
 
                     accumulated_text.append(text_chunk)
                     delta_event = {
-                        "id": resp_id,
+                        "type": "response.output_text.delta",
                         "output_index": output_index,
                         "content_index": 0,
                         "delta": text_chunk
@@ -3635,7 +3684,7 @@ async def handle_openai_responses(request: Request):
                                 "args": []
                             }
                             item_added = {
-                                "id": resp_id,
+                                "type": "response.output_item.added",
                                 "output_index": tool_out_idx,
                                 "item": {
                                     "id": t_id,
@@ -3653,7 +3702,7 @@ async def handle_openai_responses(request: Request):
                         if fn_args:
                             entry["args"].append(fn_args)
                             arg_event = {
-                                "id": resp_id,
+                                "type": "response.function_call_arguments.delta",
                                 "output_index": entry["output_idx"],
                                 "call_id": entry["id"],
                                 "delta": fn_args
@@ -3664,21 +3713,21 @@ async def handle_openai_responses(request: Request):
             if msg_started:
                 full_text = "".join(accumulated_text)
                 text_done = {
-                    "id": resp_id,
+                    "type": "response.output_text.done",
                     "output_index": output_index,
                     "content_index": 0,
                     "text": full_text
                 }
                 yield f"event: response.output_text.done\ndata: {json.dumps(text_done)}\n\n"
                 part_done = {
-                    "id": resp_id,
+                    "type": "response.content_part.done",
                     "output_index": output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": full_text}
                 }
                 yield f"event: response.content_part.done\ndata: {json.dumps(part_done)}\n\n"
                 item_done = {
-                    "id": resp_id,
+                    "type": "response.output_item.done",
                     "output_index": output_index,
                     "item": {
                         "id": msg_id,
@@ -3694,14 +3743,14 @@ async def handle_openai_responses(request: Request):
             for t_idx, entry in tool_calls_map.items():
                 full_args = "".join(entry["args"])
                 arg_done = {
-                    "id": resp_id,
+                    "type": "response.function_call_arguments.done",
                     "output_index": entry["output_idx"],
                     "call_id": entry["id"],
                     "arguments": full_args
                 }
                 yield f"event: response.function_call_arguments.done\ndata: {json.dumps(arg_done)}\n\n"
                 item_done = {
-                    "id": resp_id,
+                    "type": "response.output_item.done",
                     "output_index": entry["output_idx"],
                     "item": {
                         "id": entry["id"],
@@ -3713,7 +3762,7 @@ async def handle_openai_responses(request: Request):
                 }
                 yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
 
-            # response.completed 终结事件与 [DONE]
+            # response.completed 终结事件 (规范不带 data: [DONE])
             final_outputs = []
             if msg_started:
                 final_outputs.append({
@@ -3732,22 +3781,26 @@ async def handle_openai_responses(request: Request):
                     "arguments": "".join(entry["args"])
                 })
 
+            total_comp_tokens = max(1, len("".join(accumulated_text)) // 4)
             completed_event = {
-                "id": resp_id,
-                "object": "response",
-                "status": "completed",
-                "model": final_model,
-                "output": final_outputs,
-                "usage": {
-                    "prompt_tokens": 15,
-                    "completion_tokens": max(1, len("".join(accumulated_text)) // 4),
-                    "total_tokens": 15 + max(1, len("".join(accumulated_text)) // 4)
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "status": "completed",
+                    "model": final_model,
+                    "output": final_outputs,
+                    "usage": {
+                        "input_tokens": 15,
+                        "output_tokens": total_comp_tokens,
+                        "total_tokens": 15 + total_comp_tokens
+                    }
                 }
             }
             yield f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n"
-            yield "data: [DONE]\n\n"
         finally:
-            await upstream_res.aclose()
+            if upstream_res:
+                await upstream_res.aclose()
             await internal_client.aclose()
 
     return StreamingResponse(stream_responses_generator(), media_type="text/event-stream")
@@ -3766,8 +3819,8 @@ async def direct_web_search(request: Request, q: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Query parameter 'q' or JSON field 'query' is required")
     results = await execute_web_search(query)
 # ==============================================================================
-# 🎨 免费 AI 图像生成引擎与 OpenAI 图像生成协议适配 (/v1/images/generations)
-# 支持双引擎智能容灾调度：FLUX.1 (开源免Key优先) + Google Imagen 3 (官方高质量兜底)
+# 🎨 官方 Google Imagen 3 图像生成引擎与 OpenAI 图像协议适配 (/v1/images/generations)
+# 原生 100% 零水印，官方直出高质量摄影与艺术图像 (支持 1:1, 16:9, 9:16, 4:3, 3:4)
 # ==============================================================================
 def get_google_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
     """获取可用的 Google API Key (请求头参数 > 环境变量 > 配置渠道)"""
@@ -3799,12 +3852,13 @@ def get_imagen_aspect_ratio(width: int, height: int) -> str:
 async def generate_with_google_imagen(
     prompt: str,
     aspect_ratio: str = "1:1",
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    model: Optional[str] = None
 ) -> Optional[bytes]:
-    """通过 Google AI Studio 官方 Imagen 3 扩散模型生成图像"""
+    """通过 Google AI Studio 官方 Imagen 3 扩散模型生成图像 (原生 100% 零水印)"""
     key = get_google_api_key(api_key)
     if not key:
-        logger.info("ℹ️ [ImageGen/Imagen3] 未检测到有效的 Google API Key，跳过 Imagen 3 容灾")
+        logger.error("❌ [ImageGen/Imagen3] 未检测到有效的 Google API Key，无法调用 Google Imagen 3 引擎")
         return None
 
     # 获取 Google AI Studio 自定义 Base URL (若存在代理或测试服务器)
@@ -3820,6 +3874,12 @@ async def generate_with_google_imagen(
         "imagen-3.0-generate-002",
         "imagen-3.0-fast-generate-001"
     ]
+    if model:
+        m_clean = model.strip().lower()
+        if "fast" in m_clean:
+            models_to_try = ["imagen-3.0-fast-generate-001", "imagen-3.0-generate-002"]
+        elif "imagen-3.0-generate-002" in m_clean:
+            models_to_try = ["imagen-3.0-generate-002", "imagen-3.0-fast-generate-001"]
     
     headers = {
         "Content-Type": "application/json",
@@ -3846,7 +3906,7 @@ async def generate_with_google_imagen(
                     data = resp.json()
                     preds = data.get("predictions", [])
                     if preds and "bytesBase64Encoded" in preds[0]:
-                        logger.info(f"✨ [ImageGen/Imagen3] 成功使用 Google Imagen 3 ({m_id}) 生成图像！")
+                        logger.info(f"✨ [ImageGen/Imagen3] 成功使用 Google Imagen 3 ({m_id}) 生成高清零水印图像！")
                         return base64.b64decode(preds[0]["bytesBase64Encoded"])
                 logger.warning(f"⚠️ [ImageGen/Imagen3] {m_id} 响应状态码: {resp.status_code}, 内容: {resp.text[:150]}")
             except Exception as e:
@@ -3856,7 +3916,7 @@ async def generate_with_google_imagen(
 async def execute_image_generation(
     prompt: str,
     size: str = "1024x1024",
-    model: str = "flux",
+    model: str = "imagen-3",
     n: int = 1,
     response_format: str = "url",
     api_key: Optional[str] = None
@@ -3876,60 +3936,27 @@ async def execute_image_generation(
             width, height = 1024, 1024
 
     aspect_ratio = get_imagen_aspect_ratio(width, height)
-    m_lower = (model or "flux").lower()
-    prefer_imagen = ("imagen" in m_lower or "google" in m_lower)
-    target_flux_model = "turbo" if "turbo" in m_lower else "flux"
+    target_model = (model or "imagen-3").strip().lower()
+    if target_model in ["auto", "flux", "turbo", "sdxl", "default"]:
+        target_model = "imagen-3"
 
-    logger.info(f"🎨 [ImageGen] 正在生成图像: '{prompt_clean[:60]}...' (尺寸: {width}x{height}, 比例: {aspect_ratio}, 模型: {model}, 数量: {n})")
+    logger.info(f"🎨 [ImageGen] 正在通过 Google Imagen 3 生成图像: '{prompt_clean[:60]}...' (尺寸: {width}x{height}, 比例: {aspect_ratio}, 模型: {target_model}, 数量: {n})")
 
     data_items = []
     max_count = max(1, min(4, int(n or 1)))
 
     for i in range(max_count):
-        seed = int(time.time() * 1000) % 1000000 + i * 37
-        encoded_prompt = urllib.parse.quote(prompt_clean)
-        
-        img_bytes = None
-        engine_used = None
-
-        # 1. 若显式指定 Imagen 3，优先尝试 Imagen 3
-        if prefer_imagen:
-            img_bytes = await generate_with_google_imagen(prompt_clean, aspect_ratio=aspect_ratio, api_key=api_key)
-            if img_bytes:
-                engine_used = "google-imagen-3"
-            else:
-                logger.warning("⚠️ [ImageGen] Google Imagen 3 引擎出图失败，降级至 Flux 开源引擎...")
-
-        # 2. 尝试 Flux 引擎 (开源免Key)
-        if not img_bytes:
-            urls_to_try = [
-                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&model={target_flux_model}&nologo=true&seed={seed}",
-                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&model=turbo&nologo=true&seed={seed}"
-            ]
-            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-                for candidate_url in urls_to_try:
-                    try:
-                        resp = await client.get(candidate_url)
-                        if resp.status_code == 200 and len(resp.content) > 1024:
-                            img_bytes = resp.content
-                            engine_used = f"flux-{target_flux_model}"
-                            break
-                        else:
-                            logger.warning(f"⚠️ [ImageGen] Flux 候选端点响应状态码: {resp.status_code}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ [ImageGen] Flux 图像生成网络异常: {e}")
-
-        # 3. 若 Flux 失败且之前未尝试过 Imagen 3，则自动触发 Google Imagen 3 容灾切换！
-        if not img_bytes and not prefer_imagen:
-            logger.warning("⚠️ [ImageGen] Flux 免费通道请求失败或超时，自动容灾切换至 Google Imagen 3 引擎...")
-            img_bytes = await generate_with_google_imagen(prompt_clean, aspect_ratio=aspect_ratio, api_key=api_key)
-            if img_bytes:
-                engine_used = "google-imagen-3"
+        img_bytes = await generate_with_google_imagen(
+            prompt_clean,
+            aspect_ratio=aspect_ratio,
+            api_key=api_key,
+            model=target_model
+        )
 
         if not img_bytes:
             raise HTTPException(
                 status_code=502,
-                detail="Image generation failed on both Flux and Google Imagen 3 tiers. Please check network connectivity or Google API Key."
+                detail="Google Imagen 3 图像生成失败。请检查 Google AI Studio API Key 是否已正确配置并有效。"
             )
 
         file_id = f"img_{uuid.uuid4().hex[:12]}.jpg"
@@ -3941,7 +3968,7 @@ async def execute_image_generation(
 
         item = {
             "revised_prompt": prompt_clean,
-            "engine": engine_used
+            "engine": "google-imagen-3"
         }
         if response_format == "b64_json":
             item["b64_json"] = base64.b64encode(img_bytes).decode("utf-8")
@@ -3976,7 +4003,7 @@ async def create_image_generation(request: Request):
         raise HTTPException(status_code=400, detail="Missing required parameter 'prompt'")
 
     size = req_body.get("size", "1024x1024")
-    model = req_body.get("model", "auto")
+    model = req_body.get("model", "imagen-3")
     n = req_body.get("n", 1)
     response_format = req_body.get("response_format", "url")
 

@@ -84,8 +84,8 @@ def analyze_image(image_path: str, prompt: str = "请详细描述此图片中的
                 continue
             return f"❌ 视觉请求出现异常: {str(last_err)}"
 
-def generate_image_call(prompt: str, size: str = "1024x1024", model: str = "flux", output_path: str = None) -> str:
-    """调用本地网关或云端生成图像并落盘"""
+def generate_image_call(prompt: str, size: str = "1024x1024", model: str = "imagen-3", output_path: str = None) -> str:
+    """调用本地网关或 Google 官方端点生成零水印图像并落盘"""
     import time
     try:
         payload = {"prompt": prompt, "size": size, "model": model, "n": 1, "response_format": "url"}
@@ -101,22 +101,16 @@ def generate_image_call(prompt: str, size: str = "1024x1024", model: str = "flux
             if not output_path:
                 output_path = os.path.abspath(f"generated_image_{int(time.time())}.jpg")
             urllib.request.urlretrieve(img_url, output_path)
-            return f"✅ 图像生成成功！\n- 本地保存路径: {output_path}\n- 网页预览链接: {img_url}\n- Markdown: ![Generated Image](file://{output_path})"
+            return f"✅ 图像生成成功 (Google Imagen 3 · 100% 零水印)！\n- 本地保存路径: {output_path}\n- 网页预览链接: {img_url}\n- Markdown: ![Generated Image](file://{output_path})"
     except Exception as e:
         try:
-            width, height = 1024, 1024
-            if size and "x" in size:
-                parts = size.lower().split("x")
-                width, height = int(parts[0]), int(parts[1])
-            encoded = urllib.parse.quote(prompt.strip())
-            direct_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&model={model}&nologo=true&seed={int(time.time()*1000)%1000000}"
+            # 网关未启动时，直连 Google 官方 Imagen 3 端点
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from image_gen import generate_image_direct
             if not output_path:
                 output_path = os.path.abspath(f"generated_image_{int(time.time())}.jpg")
-            req = urllib.request.Request(direct_url, headers={"User-Agent": "Mozilla/5.0 (FreeToken MCP)"})
-            with urllib.request.urlopen(req, timeout=60.0) as resp:
-                with open(output_path, "wb") as f:
-                    f.write(resp.read())
-            return f"✅ 图像生成成功 (云端极速引擎)！\n- 本地保存路径: {output_path}\n- 原始图片链接: {direct_url}\n- Markdown: ![Generated Image](file://{output_path})"
+            saved_file, source_url = generate_image_direct(prompt, size, model, output_path)
+            return f"✅ 图像生成成功 (Google 官方端点直连 · 100% 零水印)！\n- 本地保存路径: {saved_file}\n- Markdown: ![Generated Image](file://{saved_file})"
         except Exception as direct_err:
             return f"❌ 图像生成失败: {direct_err}"
 

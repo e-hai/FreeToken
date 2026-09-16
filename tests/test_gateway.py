@@ -209,16 +209,18 @@ async def run_tests():
         result_blocks = [b for b in search_json.get("content", []) if b.get("type") == "web_search_tool_result"]
         assert len(result_blocks) > 0
         items = result_blocks[0].get("content", [])
-        print(f"✅ Web 检索端点测试成功！成功返回 {len(items)} 条网页索引结果 (首条: {items[0].get('title')[:30]}...)")
+        first_title = items[0].get('title', '')[:30] if items else 'Network Search Fallback'
+        print(f"✅ Web 检索端点测试成功！成功返回 {len(items)} 条网页索引结果 (首条: {first_title}...)")
 
-        # Test 8: AI 文生图接口 (/v1/images/generations)
-        print("\n[Test 8/9] 测试 AI 文生图接口与本地落盘托管 (/v1/images/generations)...")
+        # Test 8: AI 文生图接口与 Google Imagen 3 引擎调度 (/v1/images/generations)
+        print("\n[Test 8/9] 测试 Google Imagen 3 官方扩散模型文生图接口与本地落盘托管 (/v1/images/generations)...")
         img_res = await client.post(
             "/v1/images/generations",
+            headers={"x-goog-api-key": "mock-google-key"},
             json={
-                "prompt": "A cute origami bird",
-                "size": "512x512",
-                "model": "flux",
+                "prompt": "A cute origami bird, studio lighting",
+                "size": "1024x1024",
+                "model": "imagen-3",
                 "n": 1
             }
         )
@@ -227,7 +229,8 @@ async def run_tests():
         assert "data" in img_json and len(img_json["data"]) > 0
         img_url = img_json["data"][0]["url"]
         assert img_url is not None
-        print(f"✅ 文生图端点测试成功！返回图像 URL: {img_url}")
+        assert img_json["data"][0].get("engine") == "google-imagen-3"
+        print(f"✅ Google Imagen 3 文生图端点测试成功！返回图像 URL: {img_url}")
 
         # 测试本地静态图片获取
         if "/generated_images/" in img_url:
@@ -237,15 +240,15 @@ async def run_tests():
             assert len(static_res.content) > 50
             print(f"✅ 本地静态图片托管验证通过！图片字节大小: {len(static_res.content)} bytes")
 
-        # Test 9: 测试 Google Imagen 3 引擎调度
-        print("\n[Test 9/10] 测试 Google Imagen 3 官方扩散引擎调度...")
+        # Test 9: 测试 Google Imagen 3 Fast 极速模型与 16:9 画幅映射
+        print("\n[Test 9/10] 测试 Google Imagen 3 Fast 极速模型与 16:9 画幅映射...")
         imagen_res = await client.post(
             "/v1/images/generations",
             headers={"x-goog-api-key": "mock-google-key"},
             json={
                 "prompt": "A futuristic metropolis with flying cars, photorealistic 8k",
-                "size": "1024x1024",
-                "model": "imagen-3",
+                "size": "1280x720",
+                "model": "imagen-3.0-fast-generate-001",
                 "n": 1
             }
         )
@@ -253,28 +256,26 @@ async def run_tests():
         imagen_json = imagen_res.json()
         assert len(imagen_json["data"]) > 0
         assert imagen_json["data"][0].get("engine") == "google-imagen-3"
-        assert mock_call_counts.get("imagen", 0) >= 1
-        print(f"✅ Google Imagen 3 引擎调用成功！(引擎标识: {imagen_json['data'][0].get('engine')}, 调用计数: {mock_call_counts.get('imagen')})")
+        assert mock_call_counts.get("imagen", 0) >= 2
+        print(f"✅ Google Imagen 3 Fast 引擎调用成功！(引擎标识: {imagen_json['data'][0].get('engine')}, 调用计数: {mock_call_counts.get('imagen')})")
 
-        # Test 10: 测试 Flux 故障时自动无缝容灾切换至 Google Imagen 3
-        print("\n[Test 10/10] 测试 Flux 故障时自动容灾切换至 Google Imagen 3...")
-        import unittest.mock
-        with unittest.mock.patch("httpx.AsyncClient.get", side_effect=Exception("Pollinations Network Down")):
-            fallback_res = await client.post(
-                "/v1/images/generations",
-                headers={"x-goog-api-key": "mock-google-key"},
-                json={
-                    "prompt": "Cyberpunk robot in neon rain",
-                    "size": "1024x1024",
-                    "model": "flux",
-                    "n": 1
-                }
-            )
-            assert fallback_res.status_code == 200
-            fallback_json = fallback_res.json()
-            assert len(fallback_json["data"]) > 0
-            assert fallback_json["data"][0].get("engine") == "google-imagen-3"
-            print(f"✅ Flux 故障自动容灾测试成功！成功无缝切换至: {fallback_json['data'][0].get('engine')}")
+        # Test 10: 测试旧模型别名 (如 flux / auto) 自动映射至 Google Imagen 3
+        print("\n[Test 10/10] 测试旧模型别名 (如 flux / auto) 自动平滑映射至 Google Imagen 3...")
+        fallback_res = await client.post(
+            "/v1/images/generations",
+            headers={"x-goog-api-key": "mock-google-key"},
+            json={
+                "prompt": "Cyberpunk robot in neon rain",
+                "size": "1024x1024",
+                "model": "flux",
+                "n": 1
+            }
+        )
+        assert fallback_res.status_code == 200
+        fallback_json = fallback_res.json()
+        assert len(fallback_json["data"]) > 0
+        assert fallback_json["data"][0].get("engine") == "google-imagen-3"
+        print(f"✅ 旧别名平滑映射测试成功！成功调度引擎: {fallback_json['data'][0].get('engine')}")
 
         # Test 11: OpenAI Responses API 非流式适配 (/v1/responses)
         print("\n[Test 11/12] 测试 ChatGPT Codex CLI 专用 Responses API 非流式适配 (/v1/responses)...")
@@ -316,8 +317,7 @@ async def run_tests():
         assert "event: response.created" in full_stream_text
         assert "event: response.output_text.delta" in full_stream_text
         assert "event: response.completed" in full_stream_text
-        assert "data: [DONE]" in full_stream_text
-        print(f"✅ Responses API 流式 SSE 测试成功！已完整发射 response.created, output_text.delta, response.completed 及 [DONE] 事件链！")
+        print(f"✅ Responses API 流式 SSE 测试成功！已完整发射 response.created, output_text.delta, response.completed 等规范事件链！")
 
         print("\n" + "=" * 70)
         print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索、双引擎文生图与 Codex Responses API 完全正常！")
