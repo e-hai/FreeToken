@@ -509,6 +509,14 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             "deepseek-v4-flash",
             "deepseek-v4"
         ])
+    if "codex" in req_clean:
+        target_keys.update([
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "deepseek-ai/deepseek-v4-flash",
+            "deepseek-v4",
+            "deepseek-coder",
+            "codestral"
+        ])
 
     exact_candidates = []
     fuzzy_candidates = []
@@ -3358,6 +3366,391 @@ async def handle_anthropic_messages(request: Request):
         "content": [{"type": "text", "text": "OK"}],
         "stop_reason": "end_turn"
     })
+
+# ==============================================================================
+# 🤖 OpenAI Responses API 协议适配器 (/v1/responses)
+# 专为 ChatGPT Codex CLI 及新一代 Agentic 工具设计，支持 instructions/input/tools
+# 双模式流式 (SSE 语义事件流) 与非流式输出
+# ==============================================================================
+@app.post("/v1/responses")
+@app.post("/responses")
+async def handle_openai_responses(request: Request):
+    try:
+        req_body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    model = req_body.get("model", "auto")
+    instructions = req_body.get("instructions")
+    raw_input = req_body.get("input", [])
+    raw_tools = req_body.get("tools", [])
+    is_stream = req_body.get("stream", False)
+
+    converted_messages = []
+    if instructions and isinstance(instructions, str):
+        converted_messages.append({"role": "system", "content": instructions})
+
+    if isinstance(raw_input, str):
+        converted_messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if isinstance(item, str):
+                converted_messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "function_call":
+                    call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                    fn_name = item.get("name", "")
+                    args = item.get("arguments", "{}")
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    converted_messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": fn_name, "arguments": args}
+                        }]
+                    })
+                elif item_type == "function_call_output":
+                    call_id = item.get("call_id") or item.get("id") or ""
+                    output = item.get("output", "")
+                    if isinstance(output, (dict, list)):
+                        output = json.dumps(output)
+                    converted_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": str(output)
+                    })
+                elif item_type == "message" or "role" in item:
+                    role = item.get("role", "user")
+                    c = item.get("content", "")
+                    if isinstance(c, list):
+                        text_parts = []
+                        for part in c:
+                            if isinstance(part, dict) and part.get("type") in ("input_text", "text", "output_text"):
+                                text_parts.append(part.get("text", ""))
+                            elif isinstance(part, str):
+                                text_parts.append(part)
+                        c = "\n".join(text_parts) if text_parts else ""
+                    converted_messages.append({"role": role, "content": c})
+                else:
+                    converted_messages.append({"role": "user", "content": json.dumps(item)})
+
+    converted_tools = []
+    for t in raw_tools:
+        if isinstance(t, dict):
+            if t.get("type") == "function":
+                if "function" in t:
+                    converted_tools.append(t)
+                elif "name" in t:
+                    converted_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name"),
+                            "description": t.get("description", ""),
+                            "parameters": t.get("parameters", {})
+                        }
+                    })
+            else:
+                converted_tools.append(t)
+
+    chat_payload = {
+        "model": model,
+        "messages": converted_messages,
+        "stream": is_stream
+    }
+    if converted_tools:
+        chat_payload["tools"] = converted_tools
+    if "temperature" in req_body:
+        chat_payload["temperature"] = req_body["temperature"]
+
+    auth_header = request.headers.get("Authorization", "Bearer sk-free-token")
+    headers = {"Authorization": auth_header, "Content-Type": "application/json"}
+
+    # 1. 非流式处理 (stream: false)
+    if not is_stream:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0) as client:
+            res = await client.post("/v1/chat/completions", json=chat_payload, headers=headers)
+        if res.status_code != 200:
+            return JSONResponse(status_code=res.status_code, content=res.json())
+
+        chat_data = res.json()
+        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+        choice = chat_data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content_text = message.get("content")
+        tool_calls = message.get("tool_calls", [])
+
+        output_items = []
+        if content_text:
+            output_items.append({
+                "id": f"msg_{uuid.uuid4().hex[:16]}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content_text
+                    }
+                ]
+            })
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            output_items.append({
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function_call",
+                "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}")
+            })
+
+        responses_data = {
+            "id": resp_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": chat_data.get("model", model),
+            "status": "completed",
+            "output": output_items,
+            "usage": chat_data.get("usage", {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            })
+        }
+        return JSONResponse(status_code=200, content=responses_data)
+
+    # 2. 流式处理 (stream: true) -> 转换为 Responses API SSE 规范事件流
+    transport = httpx.ASGITransport(app=app)
+    internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0)
+    req = internal_client.build_request("POST", "/v1/chat/completions", json=chat_payload, headers=headers)
+    upstream_res = await internal_client.send(req, stream=True)
+
+    if upstream_res.status_code != 200:
+        err_content = await upstream_res.aread()
+        await internal_client.aclose()
+        try:
+            return JSONResponse(status_code=upstream_res.status_code, content=json.loads(err_content))
+        except:
+            return Response(status_code=upstream_res.status_code, content=err_content)
+
+    async def stream_responses_generator():
+        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+        created_at = int(time.time())
+        output_index = 0
+        msg_started = False
+        msg_id = f"msg_{uuid.uuid4().hex[:16]}"
+        accumulated_text = []
+        tool_calls_map = {}
+        final_model = model
+
+        # 发射 response.created
+        created_event = {
+            "id": resp_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": model,
+            "created_at": created_at
+        }
+        yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
+
+        try:
+            async for line in upstream_res.aiter_lines():
+                line_str = line.strip()
+                if not line_str or line_str.startswith(":"):
+                    continue
+                if line_str == "data: [DONE]":
+                    break
+                if not line_str.startswith("data: "):
+                    continue
+
+                chunk_payload = line_str[6:].strip()
+                try:
+                    chunk_obj = json.loads(chunk_payload)
+                except Exception:
+                    continue
+
+                if "model" in chunk_obj:
+                    final_model = chunk_obj["model"]
+
+                choices = chunk_obj.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+
+                # 文本增量推流
+                text_chunk = delta.get("content")
+                if text_chunk:
+                    if not msg_started:
+                        msg_started = True
+                        item_added = {
+                            "id": resp_id,
+                            "output_index": output_index,
+                            "item": {
+                                "id": msg_id,
+                                "type": "message",
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": []
+                            }
+                        }
+                        yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
+                        part_added = {
+                            "id": resp_id,
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": ""}
+                        }
+                        yield f"event: response.content_part.added\ndata: {json.dumps(part_added)}\n\n"
+
+                    accumulated_text.append(text_chunk)
+                    delta_event = {
+                        "id": resp_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text_chunk
+                    }
+                    yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
+
+                # 工具调用增量推流
+                tool_deltas = delta.get("tool_calls")
+                if tool_deltas and isinstance(tool_deltas, list):
+                    for td in tool_deltas:
+                        t_idx = td.get("index", 0)
+                        t_id = td.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                        fn = td.get("function", {})
+                        fn_name = fn.get("name", "")
+                        fn_args = fn.get("arguments", "")
+
+                        if t_idx not in tool_calls_map:
+                            tool_out_idx = (1 if msg_started else 0) + t_idx
+                            tool_calls_map[t_idx] = {
+                                "output_idx": tool_out_idx,
+                                "id": t_id,
+                                "name": fn_name,
+                                "args": []
+                            }
+                            item_added = {
+                                "id": resp_id,
+                                "output_index": tool_out_idx,
+                                "item": {
+                                    "id": t_id,
+                                    "type": "function_call",
+                                    "call_id": t_id,
+                                    "name": fn_name,
+                                    "arguments": ""
+                                }
+                            }
+                            yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
+
+                        entry = tool_calls_map[t_idx]
+                        if fn_name and not entry["name"]:
+                            entry["name"] = fn_name
+                        if fn_args:
+                            entry["args"].append(fn_args)
+                            arg_event = {
+                                "id": resp_id,
+                                "output_index": entry["output_idx"],
+                                "call_id": entry["id"],
+                                "delta": fn_args
+                            }
+                            yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_event)}\n\n"
+
+            # 文本结束事件
+            if msg_started:
+                full_text = "".join(accumulated_text)
+                text_done = {
+                    "id": resp_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": full_text
+                }
+                yield f"event: response.output_text.done\ndata: {json.dumps(text_done)}\n\n"
+                part_done = {
+                    "id": resp_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": full_text}
+                }
+                yield f"event: response.content_part.done\ndata: {json.dumps(part_done)}\n\n"
+                item_done = {
+                    "id": resp_id,
+                    "output_index": output_index,
+                    "item": {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": full_text}]
+                    }
+                }
+                yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
+
+            # 工具调用结束事件
+            for t_idx, entry in tool_calls_map.items():
+                full_args = "".join(entry["args"])
+                arg_done = {
+                    "id": resp_id,
+                    "output_index": entry["output_idx"],
+                    "call_id": entry["id"],
+                    "arguments": full_args
+                }
+                yield f"event: response.function_call_arguments.done\ndata: {json.dumps(arg_done)}\n\n"
+                item_done = {
+                    "id": resp_id,
+                    "output_index": entry["output_idx"],
+                    "item": {
+                        "id": entry["id"],
+                        "type": "function_call",
+                        "call_id": entry["id"],
+                        "name": entry["name"],
+                        "arguments": full_args
+                    }
+                }
+                yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
+
+            # response.completed 终结事件与 [DONE]
+            final_outputs = []
+            if msg_started:
+                final_outputs.append({
+                    "id": msg_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "".join(accumulated_text)}]
+                })
+            for t_idx, entry in tool_calls_map.items():
+                final_outputs.append({
+                    "id": entry["id"],
+                    "type": "function_call",
+                    "call_id": entry["id"],
+                    "name": entry["name"],
+                    "arguments": "".join(entry["args"])
+                })
+
+            completed_event = {
+                "id": resp_id,
+                "object": "response",
+                "status": "completed",
+                "model": final_model,
+                "output": final_outputs,
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": max(1, len("".join(accumulated_text)) // 4),
+                    "total_tokens": 15 + max(1, len("".join(accumulated_text)) // 4)
+                }
+            }
+            yield f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            await upstream_res.aclose()
+            await internal_client.aclose()
+
+    return StreamingResponse(stream_responses_generator(), media_type="text/event-stream")
 
 @app.get("/v1/search")
 @app.post("/v1/search")

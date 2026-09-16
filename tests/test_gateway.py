@@ -276,8 +276,51 @@ async def run_tests():
             assert fallback_json["data"][0].get("engine") == "google-imagen-3"
             print(f"✅ Flux 故障自动容灾测试成功！成功无缝切换至: {fallback_json['data'][0].get('engine')}")
 
+        # Test 11: OpenAI Responses API 非流式适配 (/v1/responses)
+        print("\n[Test 11/12] 测试 ChatGPT Codex CLI 专用 Responses API 非流式适配 (/v1/responses)...")
+        resp_res = await client.post(
+            "/v1/responses",
+            json={
+                "model": "codex",
+                "instructions": "You are a specialized Codex assistant.",
+                "input": "Write a python function to add two numbers.",
+                "stream": False
+            }
+        )
+        assert resp_res.status_code == 200
+        resp_json = resp_res.json()
+        assert resp_json.get("object") == "response"
+        assert resp_json.get("status") == "completed"
+        assert "output" in resp_json and len(resp_json["output"]) > 0
+        first_item = resp_json["output"][0]
+        assert first_item.get("type") == "message"
+        assert len(first_item.get("content", [])) > 0
+        text_out = first_item["content"][0].get("text", "")
+        assert len(text_out) > 0
+        print(f"✅ Responses API 非流式测试成功！(输出对象: {resp_json.get('object')}, 模型: {resp_json.get('model')}, 回复内容: '{text_out[:40]}...')")
+
+        # Test 12: OpenAI Responses API 流式 SSE 适配 (/v1/responses)
+        print("\n[Test 12/12] 测试 ChatGPT Codex CLI 专用 Responses API 流式 SSE 适配 (/v1/responses)...")
+        stream_res = await client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.3-codex",
+                "instructions": "You are an automated coding test agent.",
+                "input": [{"role": "user", "content": "Explain binary search in one sentence."}],
+                "stream": True
+            }
+        )
+        assert stream_res.status_code == 200
+        assert "text/event-stream" in stream_res.headers.get("content-type", "")
+        full_stream_text = stream_res.text
+        assert "event: response.created" in full_stream_text
+        assert "event: response.output_text.delta" in full_stream_text
+        assert "event: response.completed" in full_stream_text
+        assert "data: [DONE]" in full_stream_text
+        print(f"✅ Responses API 流式 SSE 测试成功！已完整发射 response.created, output_text.delta, response.completed 及 [DONE] 事件链！")
+
         print("\n" + "=" * 70)
-        print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索与 Flux/Imagen-3 自动容灾完全正常！")
+        print("🎉 全球渠道测试全部 100% 通过！网关调度容灾、实时搜索、双引擎文生图与 Codex Responses API 完全正常！")
         print("=" * 70)
     finally:
         await client.aclose()

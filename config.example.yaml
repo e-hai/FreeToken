@@ -10,6 +10,16 @@ model_aliases:
   deepseek: deepseek-ai/deepseek-v4-flash-0731
   gemini-3.8: gemini-3.8-flash
   gemini-3.8-flash: gemini-3.8-flash
+  vision: vision
+  vision-agent: vision
+  kimi-k3: moonshotai/kimi-k3
+  kimi3: moonshotai/kimi-k3
+  kimi: moonshotai/kimi-k3
+  codex: deepseek-ai/deepseek-v4-flash-0731
+  gpt-5.3-codex: auto
+  gpt-5.2-codex: auto
+  gpt-5.1-codex: auto
+  gpt-5-codex: auto
 providers:
 - name: Google AI Studio
   category: 全球大厂

@@ -72,3 +72,21 @@ vision "<图片文件路径>" "<你的具体分析要求或提问>"
 ### 常用典型场景示例：
 - **生成 UI 插画 / App 图标**：`python3 tools/image_gen.py "扁平化极简移动端登录页插图，科技感紫色调" -o login_illus.png`
 - **概念图 / 游戏美术 / 配图生成**：根据任务需求自主生成图片并直接嵌入 Markdown。
+
+---
+
+## ChatGPT Codex CLI / Agent 接入规范 (Codex Wire API)
+
+网关已原生支持 OpenAI 2026 Responses API 适配协议 (`POST /v1/responses`)，全面兼容 ChatGPT Codex CLI 终端代码助理。
+
+### Codex CLI 配置 (`~/.codex/config.toml`)：
+```toml
+model = "deepseek-v4"
+model_provider = "free_token"
+
+[model_providers.free_token]
+name = "FreeToken Gateway"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+```
+> 支持在 `model` 中指定 `deepseek-v4`、`codex`、`auto` 或 `gpt-5.3-codex` 等别名，全自动享受全球渠道多级故障转移容灾。

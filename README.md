@@ -14,7 +14,7 @@
 
 | 服务 | 地址 | 说明 |
 | :--- | :--- | :--- |
-| **聚合网关 API** | `http://127.0.0.1:8000/v1` | 标准 OpenAI 兼容接口，支持流式 SSE |
+| **聚合网关 API** | `http://127.0.0.1:8000/v1` | 标准 OpenAI 兼容接口，支持 Chat Completions 与 ChatGPT Codex Responses API (`/v1/responses`) |
 | **Web 可视化仪表盘** | `http://127.0.0.1:8000/` | 查看各渠道健康度、实时切换渠道与更新 Key |
 | **DeepSeek-Harness** | `http://127.0.0.1:3080/` | AI Agent 交互界面（自动对接网关与实时搜索） |
 
@@ -62,7 +62,7 @@ free-token/
 # 1. 启动全套服务 (网关 + Harness Web)
 ./start_gateway.sh
 
-# 2. 运行自动化全套自检测试 (10 项全覆盖测试，含搜索与双引擎文生图容灾)
+# 2. 运行自动化全套自检测试 (12 项全覆盖测试，含搜索、双引擎文生图容灾与 Codex Responses API)
 ./start_gateway.sh --test
 
 # 3. 独立调用 AI 文生图 (支持 auto/flux/imagen-3，默认智能容灾)
@@ -77,9 +77,46 @@ cd harness && ./run_harness.sh
 
 ---
 
+## 🤖 客户端接入指南 (Client Integrations)
+
+### 1. ChatGPT Codex CLI (终端代码助手)
+在 `~/.codex/config.toml` 中添加：
+```toml
+model = "deepseek-v4"
+model_provider = "free_token"
+
+[model_providers.free_token]
+name = "FreeToken Gateway"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+```
+启动 Codex CLI 即可无缝驱动全球大模型天梯与自动容灾：
+```bash
+codex "帮我分析当前项目中的性能瓶颈并提供优化代码"
+```
+
+### 2. 标准 OpenAI SDK / Cursor / Aider / Claude Code
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="none"  # 本地网关免 key 验证
+)
+
+response = client.chat.completions.create(
+    model="deepseek-v4", # 或 auto, codex, kimi-k3, gemini-3.8
+    messages=[{"role": "user", "content": "你好！"}]
+)
+print(response.choices[0].message.content)
+```
+
+---
+
 ## 🌟 核心特性速览
 
 - **多渠道天梯容灾**：NVIDIA NIM、Groq、Cloudflare、SiliconFlow 等 10+ 渠道聚合，单个渠道模型全挂后自动顺滑晋级下一个渠道，报错秒级熔断。
+- **ChatGPT Codex CLI 原生兼容 (`/v1/responses`)**：完整实现 OpenAI 2026 Responses API 协议，支持 `instructions`、结构化 `input` 对话流转译与双向 SSE 流式事件链，让官方 Codex CLI 直连本地网关调度池。
 - **AI 文生图双引擎容灾 (`/v1/images/generations`)**：兼容 OpenAI 图像生成协议，默认优先调用 Flux 免 Key 极速高质量模型；若遇网络波动或故障，系统自动无缝容灾切换至 **Google Imagen 3** 官方大模型出图，支持 Web 可视化实验室一键出图与本地静态托管。
 - **内置零成本实时搜索**：原生拦截 Harness `web_search`，由 Headless Chrome / DuckDuckGo 实时抓取，免付费 Key、无调用限制。
 - **挂载 Chrome DevTools MCP**：支持 Agent 操作真实 Chrome 浏览器打开页面、点击链接、阅读长文。
