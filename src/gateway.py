@@ -24,41 +24,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Gateway")
 
-def _resolve_config_path() -> str:
+def _resolve_config_path(default_name: str = "config.yaml") -> str:
     env_path = os.environ.get("CONFIG_PATH")
     if env_path and os.path.exists(env_path):
         return env_path
-    root_config = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
-    if os.path.exists(root_config):
-        return root_config
-    src_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-    if os.path.exists(src_config):
-        return src_config
-    return root_config
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    target_path = os.path.join(root_dir, default_name)
+    if os.path.exists(target_path):
+        return target_path
+    src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), default_name)
+    if os.path.exists(src_path):
+        return src_path
+    return target_path
 
-CONFIG_PATH = _resolve_config_path()
+CONFIG_PATH = _resolve_config_path("config.yaml")
+PROJECT_ROOT = os.path.dirname(CONFIG_PATH)
 
-GENERATED_IMAGES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static", "generated_images")
+HARNESS_CONFIG_PATH = os.environ.get("CONFIG_HARNESS_PATH") or os.path.join(PROJECT_ROOT, "config.harness.yaml")
+CODEX_CONFIG_PATH = os.environ.get("CONFIG_CODEX_PATH") or os.path.join(PROJECT_ROOT, "config.codex.yaml")
+
+GENERATED_IMAGES_DIR = os.path.join(PROJECT_ROOT, "static", "generated_images")
 os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
 
-def load_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"Config file not found at {CONFIG_PATH}")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-def save_config(config: dict, force_key_updates: Optional[dict] = None):
+def _ensure_channel_configs():
+    base_cfg = {}
     if os.path.exists(CONFIG_PATH):
         try:
-            shutil.copy2(CONFIG_PATH, f"{CONFIG_PATH}.bak")
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                base_cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.warning(f"Failed to read base config: {e}")
+    if not base_cfg:
+        example_path = os.path.join(PROJECT_ROOT, "config.example.yaml")
+        if os.path.exists(example_path):
+            with open(example_path, "r", encoding="utf-8") as f:
+                base_cfg = yaml.safe_load(f) or {}
+
+    # 1. 自动派生 config.harness.yaml (端口 8000)
+    if not os.path.exists(HARNESS_CONFIG_PATH):
+        try:
+            h_cfg = copy.deepcopy(base_cfg)
+            h_cfg.setdefault("server", {})
+            h_cfg["server"]["port"] = 8000
+            h_cfg["server"]["description"] = "DeepSeek Harness & Web Management Gateway"
+            with open(HARNESS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                yaml.safe_dump(h_cfg, f, allow_unicode=True, sort_keys=False)
+            logger.info(f"✨ 已自动从基础配置派生 DeepSeek Harness 配置文件: {HARNESS_CONFIG_PATH}")
+        except Exception as e:
+            logger.error(f"派生 config.harness.yaml 失败: {e}")
+
+    # 2. 自动派生 config.codex.yaml (端口 8001)
+    if not os.path.exists(CODEX_CONFIG_PATH):
+        try:
+            c_cfg = copy.deepcopy(base_cfg)
+            c_cfg.setdefault("server", {})
+            c_cfg["server"]["port"] = 8001
+            c_cfg["server"]["description"] = "ChatGPT Codex CLI Dedicated Wire Gateway"
+            with open(CODEX_CONFIG_PATH, "w", encoding="utf-8") as f:
+                yaml.safe_dump(c_cfg, f, allow_unicode=True, sort_keys=False)
+            logger.info(f"✨ 已自动从基础配置派生 Codex CLI 专属配置文件: {CODEX_CONFIG_PATH}")
+        except Exception as e:
+            logger.error(f"派生 config.codex.yaml 失败: {e}")
+
+def _get_channel_config_path(channel: str = "harness") -> str:
+    return CODEX_CONFIG_PATH if channel == "codex" else HARNESS_CONFIG_PATH
+
+def load_config(channel: str = "harness") -> dict:
+    cfg_path = _get_channel_config_path(channel)
+    if not os.path.exists(cfg_path):
+        _ensure_channel_configs()
+    if not os.path.exists(cfg_path):
+        # 兜底读取 CONFIG_PATH
+        cfg_path = CONFIG_PATH
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Config file not found at {cfg_path}")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+def save_config(config: dict, channel: str = "harness", force_key_updates: Optional[dict] = None):
+    cfg_path = _get_channel_config_path(channel)
+    if os.path.exists(cfg_path):
+        try:
+            shutil.copy2(cfg_path, f"{cfg_path}.bak")
         except Exception as e:
             logger.warning(f"Backup config file failed: {e}")
 
     existing_keys = {}
     existing_enabled = {}
-    if os.path.exists(CONFIG_PATH):
+    if os.path.exists(cfg_path):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(cfg_path, "r", encoding="utf-8") as f:
                 disk_cfg = yaml.safe_load(f) or {}
                 for p in disk_cfg.get("providers", []):
                     p_name = p.get("name")
@@ -82,7 +137,6 @@ def save_config(config: dict, force_key_updates: Optional[dict] = None):
                 if p_name in existing_enabled:
                     p["enabled"] = existing_enabled[p_name]
 
-    # 彻底过滤临时 Mock/测试提供商，防止测试或调试流量意外落盘污染配置文件
     clean_providers = [
         p for p in config.get("providers", [])
         if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
@@ -90,23 +144,33 @@ def save_config(config: dict, force_key_updates: Optional[dict] = None):
     dump_cfg = copy.deepcopy(config)
     dump_cfg["providers"] = clean_providers
 
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    with open(cfg_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(dump_cfg, f, allow_unicode=True, sort_keys=False)
-    logger.info("Config saved successfully.")
+    logger.info(f"Config for [{channel}] saved successfully to {cfg_path}.")
 
-app = FastAPI(title="Free Token Aggregator Gateway", version="3.0.0")
+# 实例化双端 FastAPI 应用
+app_harness = FastAPI(title="Free Token Harness & Web Gateway", version="3.0.0")
+app_codex = FastAPI(title="Free Token Codex Dedicated Gateway", version="3.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+for _sub_app in [app_harness, app_codex]:
+    _sub_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# 保持 app 别名，兼容旧代码与测试导入
+app = app_harness
 
 class GatewayState:
     def __init__(self):
-        self.config = load_config()
+        _ensure_channel_configs()
+        self.harness_config = load_config("harness")
+        self.codex_config = load_config("codex")
+        # 为兼容旧属性，默认 self.config 指向 harness_config
+        self.config = self.harness_config
         self.stats = {
             "total_requests": 0,
             "success_requests": 0,
@@ -114,47 +178,97 @@ class GatewayState:
             "failover_events": 0,
             "tier_fallback_events": 0,
             "total_latency_sum": 0,
-            "provider_stats": {}
+            "provider_stats": {},
+            "harness": {
+                "total_requests": 0,
+                "success_requests": 0,
+                "failed_requests": 0,
+                "failover_events": 0,
+                "tier_fallback_events": 0,
+                "total_latency_sum": 0,
+                "tokens": 0,
+                "provider_stats": {}
+            },
+            "codex": {
+                "total_requests": 0,
+                "success_requests": 0,
+                "failed_requests": 0,
+                "failover_events": 0,
+                "tier_fallback_events": 0,
+                "total_latency_sum": 0,
+                "tokens": 0,
+                "tool_calls": {
+                    "apply_patch": 0,
+                    "exec_command": 0,
+                    "other": 0
+                },
+                "provider_stats": {}
+            }
         }
         self.request_logs = []
         self.tier_indices = {}
         self.start_time = time.time()
-        self.provider_cooldowns = {}  # {provider_name: expire_time}
-        self.model_cooldowns = {}     # {f"{provider_name}:{model_name}": expire_time}
+        self.provider_cooldowns = {}
+        self.model_cooldowns = {}
         self._init_stats()
 
-    def _init_stats(self):
-        for p in self.config.get("providers", []):
-            name = p.get("name")
-            if name not in self.stats["provider_stats"]:
-                self.stats["provider_stats"][name] = {
-                    "calls": 0,
-                    "success": 0,
-                    "errors": 0,
-                    "last_error": "",
-                    "last_latency_ms": 0,
-                    "status": "Active" if p.get("enabled") else "Disabled"
-                }
+    def get_config(self, channel: str = "harness") -> dict:
+        if channel == "codex":
+            return self.codex_config
+        return self.harness_config
 
-    def add_log(self, entry: dict):
+    def _init_stats(self):
+        for ch, cfg in [("harness", self.harness_config), ("codex", self.codex_config)]:
+            ch_stats = self.stats[ch]["provider_stats"]
+            for p in cfg.get("providers", []):
+                name = p.get("name")
+                if name not in ch_stats:
+                    ch_stats[name] = {
+                        "calls": 0,
+                        "success": 0,
+                        "errors": 0,
+                        "last_error": "",
+                        "last_latency_ms": 0,
+                        "status": "Active" if p.get("enabled") else "Disabled"
+                    }
+                if name not in self.stats["provider_stats"]:
+                    self.stats["provider_stats"][name] = dict(ch_stats[name])
+
+    def add_log(self, entry: dict, channel: str = "global"):
+        entry["channel"] = channel
         self.request_logs.insert(0, entry)
-        if len(self.request_logs) > 200:
+        if len(self.request_logs) > 300:
             self.request_logs.pop()
 
-    def reload_config(self):
-        # 保留当前内存中临时注入的 Mock 渠道 (不落盘，仅测试过程有效)
-        mock_providers = [
-            p for p in self.config.get("providers", [])
+    def reload_config(self, channel: Optional[str] = None):
+        mock_harness = [
+            p for p in self.harness_config.get("providers", [])
             if p.get("name", "").startswith("Mock-") or ":8999" in str(p.get("base_url", ""))
         ]
-        self.config = load_config()
-        if mock_providers:
-            # 重新置顶注入临时 mock providers
-            real_providers = [
-                p for p in self.config.get("providers", [])
-                if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
-            ]
-            self.config["providers"] = mock_providers + real_providers
+        mock_codex = [
+            p for p in self.codex_config.get("providers", [])
+            if p.get("name", "").startswith("Mock-") or ":8999" in str(p.get("base_url", ""))
+        ]
+        if channel in (None, "harness"):
+            self.harness_config = load_config("harness")
+            if mock_harness:
+                real_h = [
+                    p for p in self.harness_config.get("providers", [])
+                    if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
+                ]
+                self.harness_config["providers"] = mock_harness + real_h
+
+        if channel in (None, "codex"):
+            self.codex_config = load_config("codex")
+            mock_to_add = mock_codex if mock_codex else mock_harness
+            if mock_to_add:
+                real_c = [
+                    p for p in self.codex_config.get("providers", [])
+                    if not p.get("name", "").startswith("Mock-") and ":8999" not in str(p.get("base_url", ""))
+                ]
+                self.codex_config["providers"] = mock_to_add + real_c
+
+        self.config = self.harness_config
         self._init_stats()
 
 state = GatewayState()
@@ -304,9 +418,10 @@ def extract_and_convert_xml_tool_calls(text: str):
     return cleaned_text, tool_calls
 
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
-def build_tiered_execution_plan(requested_model: str, has_image: bool = False, has_tools: bool = False) -> List[Dict[str, Any]]:
+def build_tiered_execution_plan(requested_model: str, has_image: bool = False, has_tools: bool = False, channel: str = "harness") -> List[Dict[str, Any]]:
     req_clean = requested_model.lower().strip()
-    providers = state.config.get("providers", [])
+    cfg = state.get_config(channel)
+    providers = cfg.get("providers", [])
     active_providers = [
         p for p in providers 
         if p.get("enabled") and p.get("api_key") and not p.get("api_key", "").startswith("YOUR_")
@@ -316,7 +431,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
 
     # 1. 当请求 "vision" 时，执行专属多模态视觉天梯 (Google Gemini 3.8 / 3.6 / 3.5 Flash 优先)
     if req_clean in ["vision", "vision-agent", "gemini-vision"]:
-        ladders_config = state.config.get("fallback_ladders", {})
+        ladders_config = cfg.get("fallback_ladders", {})
         ladder = ladders_config.get("vision", [])
         plan_tiers = []
         for tier_info in ladder:
@@ -506,7 +621,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
         return plan_tiers
 
     # 2. 当请求 "deepseek-v4-flash"（或指定模型）时，大厂优先轮询目标模型，并追加紧急高可用保活层
-    aliases = state.config.get("model_aliases", {})
+    aliases = cfg.get("model_aliases", {})
     alias_target = aliases.get(requested_model, aliases.get(req_clean, requested_model))
     target_keys = {
         requested_model.lower(),
@@ -676,1528 +791,247 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             })
     return plans
 
-# 1. 深度复刻 Linear.app 官方设计系统控制台（精简双模型版）
-@app.get("/", response_class=HTMLResponse)
+# 1. 深度复刻 Linear.app 官方设计系统控制台（单页聚合双轨三 Tab 版）
+from dashboard_html import get_dashboard_html
+
+@app_harness.get("/", response_class=HTMLResponse)
 async def dashboard():
     state._init_stats()
-    providers_json = json.dumps(state.config.get("providers", []))
-    stats_json = json.dumps(state.stats)
-    
-    total_calls = state.stats["total_requests"]
-    success_calls = state.stats["success_requests"]
-    success_rate = f"{(success_calls / total_calls * 100):.1f}%" if total_calls > 0 else "100.0%"
-    avg_latency = f"{(state.stats.get('total_latency_sum', 0) / success_calls):.0f}ms" if success_calls > 0 else "0ms"
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Linear Gateway · Free Token 调度中心 (精简版)</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-        <style>
-            :root {{
-                --bg-body: #08090c;
-                --bg-card: rgba(18, 20, 26, 0.75);
-                --bg-card-solid: #111318;
-                --bg-card-hover: rgba(26, 29, 38, 0.9);
-                --border-subtle: rgba(255, 255, 255, 0.06);
-                --border-card: rgba(255, 255, 255, 0.08);
-                --border-focus: rgba(94, 106, 210, 0.6);
-                
-                --text-primary: #f2f3f5;
-                --text-secondary: #8a8f98;
-                --text-tertiary: #5c6068;
-                
-                --linear-brand: #5e6ad2;
-                --linear-brand-hover: #6875e5;
-                --linear-gradient: linear-gradient(135deg, #5e6ad2 0%, #818cf8 100%);
-                --glow-brand: rgba(94, 106, 210, 0.25);
-                
-                --accent-emerald: #10b981;
-                --accent-amber: #f59e0b;
-                --accent-rose: #f43f5e;
-                --accent-cyan: #38bdf8;
-                --accent-violet: #a855f7;
-            }}
-
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            
-            body {{
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                background-color: var(--bg-body);
-                background-image: 
-                    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(94, 106, 210, 0.16), transparent),
-                    radial-gradient(circle at 10% 20%, rgba(56, 189, 248, 0.04), transparent 40%),
-                    radial-gradient(circle at 90% 80%, rgba(168, 85, 247, 0.04), transparent 40%);
-                background-attachment: fixed;
-                color: var(--text-primary);
-                min-height: 100vh;
-                padding: 28px 24px 80px;
-                letter-spacing: -0.012em;
-                -webkit-font-smoothing: antialiased;
-            }}
-
-            ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-            ::-webkit-scrollbar-track {{ background: transparent; }}
-            ::-webkit-scrollbar-thumb {{ background: rgba(255, 255, 255, 0.12); border-radius: 3px; }}
-            ::-webkit-scrollbar-thumb:hover {{ background: rgba(255, 255, 255, 0.25); }}
-
-            .container {{ max-width: 1360px; margin: 0 auto; }}
-
-            .svg-icon {{
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                width: 15px;
-                height: 15px;
-                flex-shrink: 0;
-            }}
-            .svg-icon svg {{
-                width: 100%;
-                height: 100%;
-                stroke-width: 1.8;
-                stroke: currentColor;
-                fill: none;
-                stroke-linecap: round;
-                stroke-linejoin: round;
-            }}
-            .svg-icon-lg {{ width: 18px; height: 18px; }}
-            .svg-icon-sm {{ width: 13px; height: 13px; }}
-
-            .header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 28px;
-                padding: 6px 0;
-            }}
-            .brand {{
-                display: flex;
-                align-items: center;
-                gap: 12px;
-            }}
-            .brand-icon {{
-                width: 36px;
-                height: 36px;
-                border-radius: 10px;
-                background: linear-gradient(135deg, #5e6ad2 0%, #38bdf8 100%);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                box-shadow: 0 0 20px rgba(94, 106, 210, 0.35);
-                color: white;
-            }}
-            .brand-title {{
-                font-size: 18px;
-                font-weight: 700;
-                color: var(--text-primary);
-                letter-spacing: -0.025em;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }}
-            .brand-badge {{
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid var(--border-card);
-                color: var(--text-secondary);
-                font-size: 11px;
-                font-weight: 500;
-                padding: 2px 7px;
-                border-radius: 6px;
-            }}
-            .badge-priority {{
-                background: rgba(245, 158, 11, 0.12);
-                border: 1px solid rgba(245, 158, 11, 0.3);
-                color: #fbbf24;
-                font-size: 11px;
-                font-weight: 600;
-                padding: 2px 8px;
-                border-radius: 6px;
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-            }}
-
-            .live-status {{
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                background: rgba(16, 185, 129, 0.08);
-                border: 1px solid rgba(16, 185, 129, 0.2);
-                color: #34d399;
-                padding: 3px 9px;
-                border-radius: 20px;
-                font-size: 11px;
-                font-weight: 500;
-            }}
-            .pulse-dot {{
-                width: 6px;
-                height: 6px;
-                background: #10b981;
-                border-radius: 50%;
-                box-shadow: 0 0 8px #10b981;
-                animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            }}
-            @keyframes pulse {{
-                0%, 100% {{ opacity: 1; transform: scale(1); }}
-                50% {{ opacity: .4; transform: scale(.85); }}
-            }}
-
-            .header-actions {{
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }}
-
-            .btn {{
-                background: rgba(255, 255, 255, 0.05);
-                color: var(--text-primary);
-                border: 1px solid var(--border-card);
-                padding: 6px 13px;
-                border-radius: 8px;
-                font-size: 12px;
-                font-weight: 500;
-                cursor: pointer;
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                transition: all 0.15s ease;
-                letter-spacing: -0.01em;
-            }}
-            .btn:hover {{
-                background: rgba(255, 255, 255, 0.09);
-                border-color: rgba(255, 255, 255, 0.15);
-                transform: translateY(-1px);
-            }}
-            .btn:hover .icon-rotate {{
-                transform: rotate(180deg);
-                transition: transform 0.4s ease;
-            }}
-            .btn:active {{ transform: translateY(0); }}
-            .btn-primary {{
-                background: var(--linear-brand);
-                border-color: rgba(255, 255, 255, 0.12);
-                color: white;
-                box-shadow: 0 0 16px var(--glow-brand);
-            }}
-            .btn-primary:hover {{
-                background: var(--linear-brand-hover);
-                box-shadow: 0 0 24px rgba(94, 106, 210, 0.4);
-            }}
-            .btn-danger {{
-                background: rgba(244, 63, 94, 0.08);
-                border-color: rgba(244, 63, 94, 0.2);
-                color: #fb7185;
-            }}
-            .btn-danger:hover {{
-                background: rgba(244, 63, 94, 0.2);
-                border-color: rgba(244, 63, 94, 0.4);
-                color: white;
-            }}
-            .spin {{
-                animation: spin 1s linear infinite;
-            }}
-            @keyframes spin {{
-                from {{ transform: rotate(0deg); }}
-                to {{ transform: rotate(360deg); }}
-            }}
-
-            .metrics-grid {{
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 14px;
-                margin-bottom: 24px;
-            }}
-            .metric-box {{
-                background: var(--bg-card);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
-                border: 1px solid var(--border-card);
-                border-radius: 12px;
-                padding: 16px 18px;
-                position: relative;
-                transition: border-color 0.2s, background-color 0.2s;
-            }}
-            .metric-box:hover {{
-                border-color: rgba(255, 255, 255, 0.15);
-                background: var(--bg-card-hover);
-            }}
-            .metric-top {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 8px;
-            }}
-            .metric-label {{
-                font-size: 11px;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: var(--text-secondary);
-                display: flex;
-                align-items: center;
-                gap: 6px;
-            }}
-            .metric-val {{
-                font-size: 26px;
-                font-weight: 700;
-                letter-spacing: -0.03em;
-                color: var(--text-primary);
-                font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-            }}
-            .metric-foot {{
-                font-size: 11px;
-                color: var(--text-tertiary);
-                margin-top: 4px;
-            }}
-
-            .card {{
-                background: var(--bg-card);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
-                border: 1px solid var(--border-card);
-                border-radius: 12px;
-                padding: 20px;
-                margin-bottom: 20px;
-                position: relative;
-            }}
-            .card-header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 16px;
-                flex-wrap: wrap;
-                gap: 10px;
-            }}
-            .card-title {{
-                font-size: 14px;
-                font-weight: 600;
-                color: var(--text-primary);
-                letter-spacing: -0.01em;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }}
-            .card-subtitle {{
-                font-size: 12px;
-                color: var(--text-secondary);
-            }}
-
-            /* 精简展示卡片 */
-            .models-showcase {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-                gap: 14px;
-            }}
-            .model-card {{
-                background: rgba(255, 255, 255, 0.02);
-                border: 1px solid var(--border-subtle);
-                border-radius: 10px;
-                padding: 16px 18px;
-                transition: all 0.2s ease;
-            }}
-            .model-card:hover {{
-                border-color: rgba(94, 106, 210, 0.4);
-                background: rgba(255, 255, 255, 0.04);
-            }}
-            .model-card-top {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 8px;
-            }}
-            .model-card-id {{
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 14px;
-                font-weight: 700;
-                color: var(--text-primary);
-            }}
-            .model-card-desc {{
-                font-size: 12px;
-                color: var(--text-secondary);
-                line-height: 1.5;
-            }}
-
-            .toolbar {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 14px;
-                gap: 12px;
-                flex-wrap: wrap;
-            }}
-            .search-box {{
-                position: relative;
-                width: 260px;
-            }}
-            .search-input {{
-                width: 100%;
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid var(--border-card);
-                color: var(--text-primary);
-                padding: 7px 12px 7px 32px;
-                border-radius: 8px;
-                font-size: 12px;
-                outline: none;
-                transition: all 0.15s ease;
-            }}
-            .search-input:focus {{
-                border-color: var(--border-focus);
-                background: rgba(255, 255, 255, 0.06);
-                box-shadow: 0 0 0 3px rgba(94, 106, 210, 0.15);
-            }}
-            .search-icon {{
-                position: absolute;
-                left: 10px;
-                top: 50%;
-                transform: translateY(-50%);
-                color: var(--text-tertiary);
-                display: flex;
-                align-items: center;
-            }}
-            
-            .segmented-control {{
-                display: flex;
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid var(--border-card);
-                padding: 2px;
-                border-radius: 8px;
-                gap: 2px;
-            }}
-            .segmented-btn {{
-                background: transparent;
-                border: none;
-                color: var(--text-secondary);
-                padding: 5px 11px;
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 500;
-                cursor: pointer;
-                transition: all 0.15s ease;
-                display: inline-flex;
-                align-items: center;
-                gap: 5px;
-            }}
-            .segmented-btn.active {{
-                background: rgba(255, 255, 255, 0.08);
-                color: var(--text-primary);
-                box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-            }}
-            .segmented-btn:hover:not(.active) {{
-                color: var(--text-primary);
-            }}
-
-            .table-container {{
-                overflow-x: auto;
-                border: 1px solid var(--border-subtle);
-                border-radius: 10px;
-                background: rgba(10, 11, 15, 0.4);
-            }}
-            table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }}
-            th {{
-                background: rgba(255, 255, 255, 0.02);
-                padding: 10px 14px;
-                font-size: 11px;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: var(--text-secondary);
-                border-bottom: 1px solid var(--border-subtle);
-            }}
-            td {{
-                padding: 11px 14px;
-                border-bottom: 1px solid var(--border-subtle);
-                color: var(--text-secondary);
-                vertical-align: middle;
-            }}
-            tr:hover td {{
-                background: rgba(255, 255, 255, 0.02);
-                color: var(--text-primary);
-            }}
-
-            .switch {{
-                position: relative;
-                display: inline-block;
-                width: 36px;
-                height: 20px;
-            }}
-            .switch input {{ opacity: 0; width: 0; height: 0; }}
-            .slider {{
-                position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-                background-color: #272a34; transition: .2s; border-radius: 20px;
-            }}
-            .slider:before {{
-                position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px;
-                background-color: #8a8f98; transition: .2s; border-radius: 50%;
-            }}
-            input:checked + .slider {{ background-color: var(--linear-brand); }}
-            input:checked + .slider:before {{ transform: translateX(16px); background-color: #ffffff; }}
-
-            .key-group {{ display: flex; align-items: center; gap: 4px; }}
-            .key-input {{
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid var(--border-card);
-                color: var(--text-primary);
-                padding: 5px 8px;
-                border-radius: 6px;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 11px;
-                width: 150px;
-                outline: none;
-            }}
-            .key-input:focus {{ border-color: var(--border-focus); }}
-
-            .badge {{
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-size: 10.5px;
-                font-weight: 500;
-                background: rgba(255, 255, 255, 0.04);
-                border: 1px solid var(--border-subtle);
-                color: var(--text-secondary);
-            }}
-            .badge-model {{
-                background: rgba(94, 106, 210, 0.08);
-                border-color: rgba(94, 106, 210, 0.25);
-                color: #a5b4fc;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 10px;
-                margin: 1px;
-            }}
-            .badge-success {{
-                background: rgba(16, 185, 129, 0.08);
-                border-color: rgba(16, 185, 129, 0.25);
-                color: #34d399;
-            }}
-            .badge-tier {{
-                background: rgba(168, 85, 247, 0.08);
-                border-color: rgba(168, 85, 247, 0.25);
-                color: #c084fc;
-            }}
-
-            .trace-step {{
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-                font-size: 10.5px;
-                background: rgba(255, 255, 255, 0.02);
-                padding: 3px 6px;
-                border-radius: 4px;
-                border: 1px solid var(--border-subtle);
-                margin: 1px 0;
-            }}
-
-            .snippet-grid {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 12px;
-            }}
-            .snippet-box {{
-                background: rgba(0, 0, 0, 0.3);
-                border: 1px solid var(--border-subtle);
-                padding: 14px;
-                border-radius: 8px;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 11px;
-                line-height: 1.6;
-                color: var(--text-secondary);
-            }}
-            .snippet-box strong {{ color: var(--text-primary); }}
-
-            #toast {{
-                position: fixed;
-                bottom: 24px;
-                right: 24px;
-                background: #151821;
-                color: var(--text-primary);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                padding: 12px 18px;
-                border-radius: 8px;
-                box-shadow: 0 12px 30px rgba(0,0,0,0.6);
-                display: none;
-                align-items: center;
-                gap: 8px;
-                border-left: 3px solid var(--linear-brand);
-                z-index: 2000;
-                font-size: 12px;
-                font-weight: 500;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <div class="brand">
-                    <div class="brand-icon">
-                        <span class="svg-icon svg-icon-lg">
-                            <svg viewBox="0 0 24 24">
-                                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                            </svg>
-                        </span>
-                    </div>
-                    <div>
-                        <div class="brand-title">
-                            Linear Gateway
-                            <span class="brand-badge">Free Token 调度中心</span>
-                            <span class="badge-priority">
-                                <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg></span>
-                                官方大厂优先调度
-                            </span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="header-actions">
-                    <div class="live-status">
-                        <span class="pulse-dot"></span>
-                        <span>精简核心双模型就绪</span>
-                    </div>
-                    <button class="btn" onclick="testCascadingSimulator()">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></span>
-                        <span>演练 Auto 降级</span>
-                    </button>
-                    <button class="btn" onclick="enableAllConfigured()">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg></span>
-                        <span>全部启用</span>
-                    </button>
-                    <button class="btn btn-primary" onclick="location.reload()">
-                        <span class="svg-icon icon-rotate"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg></span>
-                        <span>刷新</span>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Hero Metrics Grid -->
-            <div class="metrics-grid">
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg></span>
-                            Total Requests
-                        </span>
-                        <span class="svg-icon" style="color:var(--text-tertiary);"><svg viewBox="0 0 24 24"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg></span>
-                    </div>
-                    <div class="metric-val">{total_calls}</div>
-                    <div class="metric-foot">大厂优先 · 精确调度</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg></span>
-                            Success Rate
-                        </span>
-                        <span class="svg-icon" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle></svg></span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-emerald);">{success_rate}</div>
-                    <div class="metric-foot">成功请求 {success_calls} 次</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-violet);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                            Auto Fallbacks
-                        </span>
-                        <span class="svg-icon" style="color:var(--accent-violet);"><svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-violet);">{state.stats.get("tier_fallback_events", 0)}</div>
-                    <div class="metric-foot">仅在 Auto 模式下触发跨模型降级</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-amber);"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg></span>
-                            Avg Latency
-                        </span>
-                        <span class="svg-icon" style="color:var(--accent-amber);"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-amber);">{avg_latency}</div>
-                    <div class="metric-foot">Google / Groq 直连极速 ~700ms</div>
-                </div>
-            </div>
-
-            <!-- 🎯 保留的核心双模型展示卡片 -->
-            <div class="card">
-                <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                        <span>Gateway Core Flagships · 网关核心旗舰模型矩阵 (6 款)</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-                        <span class="card-subtitle" style="margin:0;">全网前沿旗舰与客户端直调暴露模型</span>
-                        <button class="btn btn-primary" id="btn-update-models-top" onclick="updateLatestModels()" style="padding:4px 12px;font-size:11.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px;" title="从全网与各渠道获取最新最强免费模型并写入配置">
-                            <span class="svg-icon svg-icon-sm" id="update-models-icon-top"><svg viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg></span>
-                            <span id="update-models-text-top">获取最新最强免费模型</span>
-                        </button>
-                    </div>
-                </div>
-                <div class="models-showcase">
-                    <div class="model-card" style="border-color: rgba(94, 106, 210, 0.4); background: rgba(94, 106, 210, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #a5b4fc;">✨ auto (推理/编程天梯)</div>
-                            <span class="badge badge-priority">全渠道自适应容灾</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>纯代码/推理智能路由：</strong>聚合 DeepSeek V4、GLM-5.3、Kimi K3 及 Nemotron 3.5，<strong>100% 隔离视觉模型</strong>，保障长流程编码极速无中断。
-                        </div>
-                    </div>
-                    <div class="model-card" style="border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #34d399;">⚡ deepseek-v4-flash</div>
-                            <span class="badge badge-success">V4 极速推理旗舰</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>DeepSeek 原生旗舰：</strong>独家优先接入 NVIDIA 满血 DeepSeek-V4-Flash 极速推理架构，毫秒级首字响应，支持多渠道同模型轮询。
-                        </div>
-                    </div>
-                    <div class="model-card" style="border-color: rgba(59, 130, 246, 0.4); background: rgba(59, 130, 246, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #93c5fd;">🌟 glm-5.3 / glm-5.3-flash</div>
-                            <span class="badge" style="background:rgba(59, 130, 246, 0.15);color:#93c5fd;border:1px solid rgba(59, 130, 246, 0.3);">智谱 2026 旗舰</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>智谱新一代推理旗舰：</strong>超强双语深度逻辑思维链，200K 上下文窗口，代码综合生成与跨文件重构能力卓越。
-                        </div>
-                    </div>
-                    <div class="model-card" style="border-color: rgba(14, 165, 233, 0.4); background: rgba(14, 165, 233, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #38bdf8;">🌙 kimi-k3</div>
-                            <span class="badge" style="background:rgba(14, 165, 233, 0.15);color:#38bdf8;border:1px solid rgba(14, 165, 233, 0.3);">月之暗面推理旗舰</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>256K 超长上下文推理：</strong>超强长程逻辑链推理，针对复杂多步规划、长文档深入分析与算法推导量身打造。
-                        </div>
-                    </div>
-                    <div class="model-card" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #fbbf24;">👁️ vision (多模态视觉专属)</div>
-                            <span class="badge" style="background:rgba(245, 158, 11, 0.15);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.3);">Google 官方百万上下文</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>多模态视觉感知天梯：</strong>专供 Google Gemini 3.8 / 3.7 Flash 顶级视觉模型，UI 控件相对定位、报错截图 OCR、架构图深度理解。
-                        </div>
-                    </div>
-                    <div class="model-card" style="border-color: rgba(168, 85, 247, 0.4); background: rgba(168, 85, 247, 0.04);">
-                        <div class="model-card-top">
-                            <div class="model-card-id" style="color: #c084fc;">🎨 image-gen (Imagen 3 零水印)</div>
-                            <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">100% 纯净零水印</span>
-                        </div>
-                        <div class="model-card-desc">
-                            <strong>Google Imagen 3 扩散生图引擎：</strong>电影级光影质感，全原生无水印渲染，支持任意宽高比与前端画廊实时落盘。
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 🎨 AI 文生图实验室 (Image Studio) -->
-            <div class="card" style="border: 1px solid rgba(59, 130, 246, 0.3); background: rgba(16, 20, 30, 0.6); margin-bottom: 24px;">
-                <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:#60a5fa;">
-                            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
-                        </span>
-                        <span>AI Image Studio · 文生图实验室</span>
-                        <span class="badge" style="background:rgba(59, 130, 246, 0.15);color:#60a5fa;border:1px solid rgba(59, 130, 246, 0.3);">
-                            Google Imagen 3 官方引擎 (100% 零水印)
-                        </span>
-                    </div>
-                </div>
-                <div style="padding: 16px 20px; display: flex; flex-direction: column; gap: 14px;">
-                    <div style="display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;">
-                        <div style="flex: 1; min-width: 280px;">
-                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">输入画面描述 (Prompt，支持中英文)：</label>
-                            <textarea id="image-prompt" rows="2" style="width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 13px; font-family: inherit; resize: vertical;" placeholder="例如：一只可爱的柴犬在阳光草坪上奔跑，真实摄影，8k画质"></textarea>
-                        </div>
-                        <div style="width: 170px;">
-                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">图像尺寸 / 比例</label>
-                            <select id="image-size" style="width: 100%; background: #161822; border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 13px;">
-                                <option value="1024x1024">1:1 方形 (1024x1024)</option>
-                                <option value="1280x720">16:9 横屏 (1280x720)</option>
-                                <option value="720x1280">9:16 竖屏 (720x1280)</option>
-                                <option value="1024x768">4:3 经典 (1024x768)</option>
-                                <option value="768x1024">3:4 人像 (768x1024)</option>
-                            </select>
-                        </div>
-                        <div style="width: 210px;">
-                            <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">扩散模型架构</label>
-                            <select id="image-model" style="width: 100%; background: #161822; border: 1px solid var(--border-card); border-radius: 6px; padding: 8px 10px; color: #fff; font-size: 13px;">
-                                <option value="imagen-3">Google Imagen 3 (官方高质量旗舰 · 0水印)</option>
-                                <option value="imagen-3.0-fast-generate-001">Google Imagen 3 Fast (极速扩散 · 0水印)</option>
-                            </select>
-                        </div>
-                        <div style="align-self: flex-end;">
-                            <button id="btn-generate-image" class="btn btn-primary" style="padding: 8px 20px; font-weight: 600; background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);" onclick="generateImageFromStudio()">
-                                <span>🎨 开始生成</span>
-                            </button>
-                        </div>
-                    </div>
-                    
-                    <div id="image-loading" style="display: none; padding: 20px; text-align: center; color: var(--text-secondary); font-size: 13px;">
-                        <span class="pulse-dot" style="display: inline-block; margin-right: 6px;"></span>
-                        正在调度 Google Imagen 3 官方扩散模型生成高清画面，请稍候约 3~6 秒...
-                    </div>
-
-                    <div id="image-result-box" style="display: none; padding-top: 10px; border-top: 1px solid var(--border-subtle);">
-                        <div style="display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;">
-                            <div style="position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-card); max-width: 480px;">
-                                <img id="image-result-preview" src="" alt="生成结果" style="display: block; max-width: 100%; height: auto; border-radius: 8px;">
-                            </div>
-                            <div style="flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 10px;">
-                                <div style="font-size: 13px; color: var(--text-secondary);">
-                                    <strong style="color: #fff;">提示词：</strong><span id="image-result-prompt"></span>
-                                </div>
-                                <div style="font-size: 12px; color: var(--text-tertiary); display: flex; align-items: center; gap: 8px;">
-                                    <strong>渲染引擎：</strong>
-                                    <span id="image-result-engine" class="badge" style="background:rgba(168, 85, 247, 0.2);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.4);">flux</span>
-                                </div>
-                                <div style="font-size: 12px; color: var(--text-tertiary);">
-                                    <strong>本地托管链接：</strong><br>
-                                    <a id="image-result-link" href="#" target="_blank" style="color: var(--accent-cyan); word-break: break-all;"></a>
-                                </div>
-                                <div style="display: flex; gap: 10px; margin-top: 8px;">
-                                    <a id="image-download-btn" href="#" download="generated_image.jpg" class="btn" style="font-size: 12px; padding: 6px 14px;">
-                                        <span>💾 下载图片</span>
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 📜 实时调用链路与模型追踪审计 -->
-            <div class="card">
-                <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></span>
-                        <span>Live Request Traces</span>
-                        <span class="badge badge-success">
-                            <span class="pulse-dot" style="width:5px;height:5px;"></span>
-                            实时监听中
-                        </span>
-                    </div>
-                    <div style="display:flex;gap:6px;">
-                        <button class="btn" style="padding:4px 10px;font-size:11px;" onclick="loadLogs()">
-                            <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg></span>
-                            <span>刷新日志</span>
-                        </button>
-                        <button class="btn btn-danger" style="padding:4px 10px;font-size:11px;" onclick="clearLogs()">
-                            <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></span>
-                            <span>清空</span>
-                        </button>
-                    </div>
-                </div>
-
-                <div class="table-container" style="max-height: 360px;">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th style="width:85px;">Time</th>
-                                <th style="width:140px;">Client Model</th>
-                                <th style="width:180px;">Routed Provider</th>
-                                <th style="width:220px;">Upstream Model</th>
-                                <th>Fallback Trace Steps</th>
-                                <th style="width:85px;">Latency</th>
-                                <th style="width:110px;">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="logs-table"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- 📡 活跃渠道管理与在线测速 -->
-            <div class="card">
-                <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg></span>
-                        <span>Active Providers (<span id="total-count">0</span>)</span>
-                    </div>
-                    <span class="card-subtitle">
-                        <span class="svg-icon svg-icon-sm" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg></span>
-                        大厂优先置顶（NVIDIA 100 > Google 95 > Groq 90 > OpenRouter 85）
-                    </span>
-                </div>
-
-                <div class="toolbar">
-                    <div class="search-box">
-                        <span class="search-icon svg-icon svg-icon-sm">
-                            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                        </span>
-                        <input type="text" id="search-box" class="search-input" placeholder="搜索渠道、模型 ID..." oninput="filterProviders()">
-                    </div>
-                    <div class="segmented-control">
-                        <button class="segmented-btn active" onclick="setCategoryFilter('all', this)">全部</button>
-                        <button class="segmented-btn" onclick="setCategoryFilter('enabled', this)">已开启</button>
-                        <button class="segmented-btn" onclick="setCategoryFilter('全球大厂', this)">👑 全球大厂</button>
-                        <button class="segmented-btn" onclick="setCategoryFilter('极速芯片', this)">⚡ 极速芯片</button>
-                        <button class="segmented-btn" onclick="setCategoryFilter('全球聚合', this)">🌍 全球聚合</button>
-                        <button class="segmented-btn" onclick="setCategoryFilter('出海中转', this)">出海中转</button>
-                    </div>
-                </div>
-
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th style="width:60px;">Status</th>
-                                <th style="width:200px;">Provider</th>
-                                <th style="width:280px;">API Key</th>
-                                <th>
-                                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-                                        <span>Models</span>
-                                        <button class="btn btn-primary" id="btn-update-models-th" onclick="updateLatestModels()" title="获取最新最强免费模型到配置" style="padding:2px 8px;font-size:10.5px;font-weight:600;display:inline-flex;align-items:center;gap:4px;">
-                                            <span class="svg-icon svg-icon-sm" id="update-models-icon-th" style="width:11px;height:11px;"><svg viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg></span>
-                                            <span id="update-models-text-th">更新模型</span>
-                                        </button>
-                                    </div>
-                                </th>
-                                <th style="width:90px;">Calls</th>
-                                <th style="width:170px;">Ping Test</th>
-                                <th style="width:50px;">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="providers-table"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- 🔌 配置指南 -->
-            <div class="card">
-                <div class="card-title" style="margin-bottom:12px;">
-                    <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></span>
-                    <span>Quick Setup & Client Integration</span>
-                </div>
-                <div class="snippet-grid">
-                    <div class="snippet-box">
-                        <strong style="color:var(--linear-brand);">DeepSeek-Harness / Web Client:</strong><br>
-                        <strong>Base URL</strong>: http://127.0.0.1:{state.config['server']['port']}/v1<br>
-                        <strong>API Key </strong>: free-token<br>
-                        <strong>Available Models</strong>:<br>
-                        &nbsp;&nbsp;1. <strong>auto</strong> (推荐：顶级大厂代码与推理自适应降级)<br>
-                        &nbsp;&nbsp;2. <strong>deepseek-v4-flash</strong> (DeepSeek 极速架构 · 同模型轮询)<br>
-                        &nbsp;&nbsp;3. <strong>vision</strong> (多模态视觉专属 · Google Gemini 3.8 Flash)
-                    </div>
-                    <div class="snippet-box">
-                        <strong style="color:var(--linear-brand);">Python / OpenAI SDK:</strong><br>
-                        from openai import OpenAI<br>
-                        client = OpenAI(base_url="http://127.0.0.1:{state.config['server']['port']}/v1", api_key="free-token")<br>
-                        resp = client.chat.completions.create(model="auto", messages=[{{"role": "user", "content": "Hello!"}}])
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div id="toast"></div>
-
-        <script>
-            let providers = {providers_json};
-            let stats = {stats_json};
-            let currentCategory = "all";
-
-            function showToast(msg, type = "info", duration = 3000) {{
-                const t = document.getElementById("toast");
-                t.innerHTML = msg;
-                if (type === "success") {{
-                    t.style.borderLeftColor = "var(--accent-emerald)";
-                }} else if (type === "error") {{
-                    t.style.borderLeftColor = "var(--accent-rose)";
-                }} else {{
-                    t.style.borderLeftColor = "var(--linear-brand)";
-                }}
-                t.style.display = "flex";
-                if (window._toastTimer) clearTimeout(window._toastTimer);
-                window._toastTimer = setTimeout(() => {{ t.style.display = "none"; }}, duration);
-            }}
-
-            function setCategoryFilter(cat, btn) {{
-                currentCategory = cat;
-                document.querySelectorAll(".segmented-btn").forEach(b => b.classList.remove("active"));
-                btn.classList.add("active");
-                filterProviders();
-            }}
-
-            function filterProviders() {{
-                const query = document.getElementById("search-box").value.toLowerCase().trim();
-                const filtered = providers.filter(p => {{
-                    const matchCat = currentCategory === "all" || 
-                                     (currentCategory === "enabled" && p.enabled) ||
-                                     (p.category === currentCategory);
-                    const matchQuery = !query || 
-                                       p.name.toLowerCase().includes(query) ||
-                                       (p.category && p.category.toLowerCase().includes(query)) ||
-                                       (p.models || []).some(m => m.id.toLowerCase().includes(query) || (m.upstream_model && m.upstream_model.toLowerCase().includes(query)));
-                    return matchCat && matchQuery;
-                }});
-                renderTable(filtered);
-            }}
-
-            function renderTable(list = providers) {{
-                const tbody = document.getElementById("providers-table");
-                document.getElementById("total-count").innerText = list.length;
-                tbody.innerHTML = "";
-
-                if (list.length === 0) {{
-                    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-tertiary);padding:24px;">No matching providers found</td></tr>`;
-                    return;
-                }}
-
-                list.forEach((p) => {{
-                    const pStat = stats.provider_stats[p.name] || {{ calls: 0, success: 0, errors: 0, last_latency_ms: 0 }};
-                    const allModelIds = (p.models || []).map(m => m.id).join(", ");
-                    const isFlagship = (id) => {{
-                        const low = (id || "").toLowerCase();
-                        return low.includes("deepseek-v4") || low.includes("glm-5.3") || low.includes("kimi-k3") ||
-                               low.includes("nemotron-3.5") || low.includes("gemini-3.8") || low.includes("inkling");
-                    }};
-                    const modelsHtml = (p.models || []).slice(0, 8).map(m => {{
-                        if (isFlagship(m.id)) {{
-                            return `<span class="badge badge-priority" style="cursor:pointer;font-size:10px;padding:2px 7px;background:rgba(94, 106, 210, 0.25);border:1px solid rgba(165, 180, 252, 0.4);color:#c7d2fe;" title="${{m.id}} (点击复制)" onclick="copyText('${{m.id}}')">★ ${{m.id}}</span>`;
-                        }}
-                        return `<span class="badge badge-model" style="cursor:pointer;" title="${{m.id}} (点击复制)" onclick="copyText('${{m.id}}')">${{m.id}}</span>`;
-                    }}).join(" ");
-                    const moreBadge = (p.models && p.models.length > 8) 
-                        ? `<span class="badge badge-model" style="color:var(--linear-brand);cursor:pointer;font-weight:600;background:rgba(94, 106, 210, 0.15);" onclick="openModelsModal('${{p.name}}')" title="点击展开全部 ${{p.models.length}} 款模型">+${{p.models.length - 8}} 款...</span>` 
-                        : "";
-                    const categoryBadge = p.category ? `<span class="badge">${{p.category}}</span>` : "";
-                    
-                    const isBigTech = (p.priority || 0) >= 90;
-                    const rankBadge = isBigTech 
-                        ? `<span class="badge-priority" style="font-size:9.5px;padding:1px 5px;">👑 优先 (P:${{p.priority || 50}})</span>` 
-                        : `<span class="badge" style="font-size:9.5px;color:var(--text-tertiary);">P:${{p.priority || 50}}</span>`;
-
-                    const tr = document.createElement("tr");
-                    tr.innerHTML = `
-                        <td>
-                            <label class="switch">
-                                <input type="checkbox" ${{p.enabled ? "checked" : ""}} onchange="toggleProvider('${{p.name}}', this.checked)">
-                                <span class="slider"></span>
-                            </label>
-                        </td>
-                        <td>
-                            <div style="font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-                                ${{p.name}}
-                                ${{rankBadge}}
-                            </div>
-                        </td>
-                        <td>
-                            <div class="key-group">
-                                <input type="password" id="key-${{p.name}}" class="key-input" value="${{p.api_key || ""}}" placeholder="填入 API Key">
-                                <button class="btn" style="padding:4px 6px;" onclick="toggleKeyVisibility('${{p.name}}')" title="显示/隐藏">
-                                    <span class="svg-icon svg-icon-sm" id="eye-icon-${{p.name}}"><svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></span>
-                                </button>
-                                <button class="btn btn-primary" style="padding:4px 9px;font-size:11px;" onclick="saveKey('${{p.name}}')">
-                                    <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></span>
-                                    <span>保存</span>
-                                </button>
-                            </div>
-                        </td>
-                        <td>
-                            <div style="display:flex;flex-wrap:wrap;align-items:center;">
-                                ${{modelsHtml}} ${{moreBadge}}
-                            </div>
-                        </td>
-                        <td>
-                            <strong style="color:var(--text-primary);">${{pStat.calls}}</strong> / <span style="color:var(--accent-emerald);font-weight:600;">${{pStat.success}}</span>
-                        </td>
-                        <td>
-                            <button class="btn" style="padding:4px 9px;font-size:11px;" id="test-btn-${{p.name}}" onclick="testProviderKey('${{p.name}}')">
-                                <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></span>
-                                <span>测速</span>
-                            </button>
-                            <span id="test-res-${{p.name}}" style="margin-left:6px;font-size:11px;"></span>
-                        </td>
-                        <td>
-                            <button class="btn btn-danger" style="padding:4px 6px;" onclick="deleteProvider('${{p.name}}')" title="删除此渠道">
-                                <span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></span>
-                            </button>
-                        </td>
-                    `;
-                    tbody.appendChild(tr);
-                }});
-            }}
-
-            function toggleKeyVisibility(name) {{
-                const input = document.getElementById(`key-${{name}}`);
-                const isPass = input.type === "password";
-                input.type = isPass ? "text" : "password";
-                const eyeSpan = document.getElementById(`eye-icon-${{name}}`);
-                if (eyeSpan) {{
-                    eyeSpan.innerHTML = isPass 
-                        ? `<svg viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`
-                        : `<svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>`;
-                }}
-            }}
-
-            async function toggleProvider(name, enabled) {{
-                try {{
-                    const res = await fetch("/api/providers/toggle", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ name, enabled }})
-                    }});
-                    const data = await res.json();
-                    if (res.ok) {{
-                        const p = providers.find(item => item.name === name);
-                        if (p) p.enabled = enabled;
-                        showToast(`[${{name}}] 已${{enabled ? "开启" : "禁用"}}`, "success");
-                    }} else {{
-                        showToast(`更新失败: ${{data.detail || "未知错误"}}`, "error");
-                    }}
-                }} catch (e) {{
-                    showToast(`网络请求失败: ${{e.message}}`, "error");
-                }}
-            }}
-
-            async function saveKey(name) {{
-                const key = document.getElementById(`key-${{name}}`).value.trim();
-                try {{
-                    const res = await fetch("/api/providers/update_key", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ name, api_key: key }})
-                    }});
-                    const data = await res.json();
-                    if (res.ok) {{
-                        const p = providers.find(item => item.name === name);
-                        if (p) {{
-                            p.api_key = key;
-                            if (key && !key.startswith("YOUR_")) p.enabled = true;
-                        }}
-                        showToast(`[${{name}}] API Key 保存成功`, "success");
-                    }} else {{
-                        showToast(`保存失败: ${{data.detail || "未知错误"}}`, "error");
-                    }}
-                }} catch (e) {{
-                    showToast(`保存失败: ${{e.message}}`, "error");
-                }}
-            }}
-
-            async function deleteProvider(name) {{
-                if (!confirm(`确定要从网关中删除渠道 [${{name}}] 吗？`)) return;
-                try {{
-                    const res = await fetch("/api/providers/delete", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ name }})
-                    }});
-                    if (res.ok) {{
-                        providers = providers.filter(p => p.name !== name);
-                        showToast(`渠道 [${{name}}] 已删除`, "success");
-                        filterProviders();
-                    }} else {{
-                        showToast(`删除失败`, "error");
-                    }}
-                }} catch (e) {{
-                    showToast(`删除失败: ${{e.message}}`, "error");
-                }}
-            }}
-
-            async function testProviderKey(name) {{
-                const btn = document.getElementById(`test-btn-${{name}}`);
-                const resSpan = document.getElementById(`test-res-${{name}}`);
-                btn.disabled = true;
-                btn.innerHTML = `<span class="svg-icon svg-icon-sm icon-rotate"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg></span><span>测速中</span>`;
-                resSpan.innerHTML = "";
-
-                try {{
-                    const res = await fetch("/api/providers/test", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ name }})
-                    }});
-                    const data = await res.json();
-                    if (data.status === "ok") {{
-                        resSpan.innerHTML = `<span style="color:var(--accent-emerald);font-weight:600;display:inline-flex;align-items:center;gap:3px;"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></span>${{data.latency_ms}}ms</span>`;
-                        showToast(`[${{name}}] 测速正常: ${{data.latency_ms}}ms`, "success");
-                    }} else {{
-                        resSpan.innerHTML = `<span style="color:var(--accent-rose);font-weight:600;display:inline-flex;align-items:center;gap:3px;"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg></span>失败</span>`;
-                        showToast(`[${{name}}] 验证未通过: ${{data.message}}`, "error");
-                    }}
-                }} catch (e) {{
-                    resSpan.innerHTML = `<span style="color:var(--accent-rose);">超时</span>`;
-                }} finally {{
-                    btn.disabled = false;
-                    btn.innerHTML = `<span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></span><span>测速</span>`;
-                }}
-            }}
-
-            async function enableAllConfigured() {{
-                let count = 0;
-                for (const p of providers) {{
-                    if (p.api_key && !p.api_key.startsWith("YOUR_") && !p.enabled) {{
-                        await toggleProvider(p.name, true);
-                        count++;
-                    }}
-                }}
-                showToast(`已开启 ${{count}} 个有效渠道`, "success");
-                filterProviders();
-            }}
-
-            async function testCascadingSimulator() {{
-                showToast("🪜 正在发起 Auto 智能降级测试...", "info");
-                try {{
-                    const res = await fetch("/v1/chat/completions", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{
-                            model: "auto",
-                            messages: [{{ role: "user", content: "Ping Auto Cascading" }}],
-                            max_tokens: 5
-                        }})
-                    }});
-                    const provider = res.headers.get("x-gateway-provider") || "Unknown";
-                    const tier = decodeURIComponent(res.headers.get("x-gateway-tier") || "Tier");
-                    const model = res.headers.get("x-gateway-model") || "Unknown";
-                    if (res.ok) {{
-                        showToast(`演练成功！命中 [${{tier}}] ➡️ ${{provider}} (${{model}})`, "success");
-                        loadLogs();
-                    }} else {{
-                        showToast("降级演练测试未成功", "error");
-                    }}
-                }} catch (e) {{
-                    showToast(`模拟测试失败: ${{e.message}}`, "error");
-                }}
-            }}
-
-            async function updateLatestModels() {{
-                const btnTop = document.getElementById("btn-update-models-top");
-                const btnTh = document.getElementById("btn-update-models-th");
-                const iconTop = document.getElementById("update-models-icon-top");
-                const iconTh = document.getElementById("update-models-icon-th");
-                const textTop = document.getElementById("update-models-text-top");
-                const textTh = document.getElementById("update-models-text-th");
-
-                if (btnTop) btnTop.disabled = true;
-                if (btnTh) btnTh.disabled = true;
-                if (iconTop) iconTop.classList.add("spin");
-                if (iconTh) iconTh.classList.add("spin");
-                if (textTop) textTop.innerText = "检索全网最新模型中...";
-                if (textTh) textTh.innerText = "更新中...";
-
-                showToast("🔍 正在跨渠道探测最新最强免费模型 (Google, Groq, NVIDIA, OpenRouter)...", "info", 5000);
-
-                try {{
-                    const res = await fetch("/api/models/update_latest", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }}
-                    }});
-                    const data = await res.json();
-                    if (data.status === "ok") {{
-                        if (data.providers) {{
-                            providers = data.providers;
-                            filterProviders();
-                        }}
-                        const highlight = data.top_models ? data.top_models.slice(0, 5).map(m => `<b>${{m.name}}</b> (${{m.provider}})`).join("、") : "";
-                        const countText = data.added_count > 0 ? `发现并接入 <b>${{data.added_count}}</b> 款新模型，` : `已校验全网 <b>${{data.total_models || 140}}</b> 款免费模型，`;
-                        showToast(`✅ <b>最新最强免费模型矩阵已置顶并写入配置！</b><br><span style="font-size:11px;color:var(--text-secondary);">${{countText}}已置顶接入 ${{highlight}} 等前沿旗舰大模型</span>`, "success", 7000);
-                    }} else {{
-                        showToast(`更新模型失败: ${{data.message || "未知错误"}}`, "error", 4000);
-                    }}
-                }} catch (e) {{
-                    showToast(`更新请求异常: ${{e.message}}`, "error", 4000);
-                }} finally {{
-                    if (btnTop) btnTop.disabled = false;
-                    if (btnTh) btnTh.disabled = false;
-                    if (iconTop) iconTop.classList.remove("spin");
-                    if (iconTh) iconTh.classList.remove("spin");
-                    if (textTop) textTop.innerText = "获取最新最强免费模型";
-                    if (textTh) textTh.innerText = "更新模型";
-                }}
-            }}
-
-            async function loadLogs() {{
-                try {{
-                    const res = await fetch("/api/logs");
-                    if (!res.ok) return;
-                    const logs = await res.json();
-                    renderLogs(logs);
-                }} catch (e) {{}}
-            }}
-
-            function renderLogs(logs) {{
-                const tbody = document.getElementById("logs-table");
-                if (!logs || logs.length === 0) {{
-                    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-tertiary);padding:24px;">暂无调用记录，发起任务后实时展示。</td></tr>`;
-                    return;
-                }}
-
-                tbody.innerHTML = "";
-                logs.forEach((log) => {{
-                    const statusBadge = log.status === "success" 
-                        ? `<span class="badge badge-success"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></span>200 OK</span>` 
-                        : (log.status === "failover_success" 
-                            ? `<span class="badge badge-tier"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="13 17 18 12 13 7"></polyline><polyline points="6 17 11 12 6 7"></polyline></svg></span>降级成功</span>` 
-                            : `<span class="badge badge-danger"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg></span>Fail (${{log.status_code || 500}})</span>`);
-
-                    let traceHtml = "";
-                    if (log.attempts && log.attempts.length > 0) {{
-                        traceHtml = log.attempts.map((att, idx) => {{
-                            const isSuccess = att.status === "success";
-                            const color = isSuccess ? "var(--accent-emerald)" : "var(--accent-rose)";
-                            const tierBadge = att.tier ? `<span class="badge badge-tier" style="margin-right:2px;">${{att.tier}}</span>` : "";
-                            const iconSvg = isSuccess 
-                                ? `<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>`
-                                : `<svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>`;
-                            return `<div class="trace-step">
-                                ${{tierBadge}}
-                                <span class="svg-icon svg-icon-sm" style="color:${{color}};">${{iconSvg}}</span>
-                                <span style="color:${{color}};font-weight:500;">${{att.provider}}</span>
-                                <span style="color:var(--text-secondary);font-family:monospace;">(${{att.model}})</span>
-                                <span style="color:var(--text-tertiary);">${{att.latency_ms}}ms</span>
-                            </div>`;
-                        }}).join(" ");
-                    }} else {{
-                        traceHtml = `<span style="color:var(--text-tertiary);display:inline-flex;align-items:center;gap:3px;"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></span>直接命中</span>`;
-                    }}
-
-                    const streamBadge = log.stream ? `<span class="badge" style="color:var(--linear-brand);font-size:9.5px;margin-left:3px;"><span class="svg-icon svg-icon-sm"><svg viewBox="0 0 24 24"><path d="M2 12h5l3 8 4-16 3 8h5"></path></svg></span>Stream</span>` : "";
-
-                    const tr = document.createElement("tr");
-                    tr.innerHTML = `
-                        <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-tertiary);">${{log.time}}</td>
-                        <td><strong style="color:var(--text-primary);font-family:'JetBrains Mono',monospace;">${{log.requested_model}}</strong>${{streamBadge}}</td>
-                        <td><span style="color:var(--text-primary);font-weight:500;">${{log.final_provider || "-"}}</span></td>
-                        <td><span style="font-family:'JetBrains Mono',monospace;color:var(--linear-brand);font-size:11px;">${{log.final_model || "-"}}</span></td>
-                        <td>${{traceHtml}}</td>
-                        <td style="font-family:'JetBrains Mono',monospace;color:var(--text-primary);">${{log.latency_ms}}ms</td>
-                        <td>${{statusBadge}}</td>
-                    `;
-                    tbody.appendChild(tr);
-                }});
-            }}
-
-            async function clearLogs() {{
-                if (!confirm("确定要清空调用日志吗？")) return;
-                try {{
-                    const res = await fetch("/api/logs/clear", {{ method: "POST" }});
-                    if (res.ok) {{
-                        showToast("调用日志已清空", "success");
-                        loadLogs();
-                    }}
-                }} catch (e) {{}}
-            }}
-
-            async function generateImageFromStudio() {{
-                const prompt = document.getElementById("image-prompt").value.trim();
-                if (!prompt) {{
-                    showToast("请输入画面描述提示词", "error");
-                    return;
-                }}
-                const size = document.getElementById("image-size").value;
-                const model = document.getElementById("image-model").value;
-                const btn = document.getElementById("btn-generate-image");
-                const loading = document.getElementById("image-loading");
-                const resultBox = document.getElementById("image-result-box");
-
-                btn.disabled = true;
-                btn.style.opacity = "0.6";
-                loading.style.display = "block";
-                resultBox.style.display = "none";
-
-                try {{
-                    const res = await fetch("/v1/images/generations", {{
-                        method: "POST",
-                        headers: {{ "Content-Type": "application/json" }},
-                        body: JSON.stringify({{ prompt, size, model, n: 1 }})
-                    }});
-                    const data = await res.json();
-                    if (!res.ok) {{
-                        throw new Error(data.detail || "生成失败");
-                    }}
-                    const imgUrl = data.data[0].url;
-                    const engineUsed = data.data[0].engine || "flux";
-                    document.getElementById("image-result-preview").src = imgUrl;
-                    document.getElementById("image-result-prompt").innerText = prompt;
-                    const engineEl = document.getElementById("image-result-engine");
-                    if (engineEl) {{
-                        engineEl.innerText = engineUsed.toUpperCase();
-                        if (engineUsed.includes("imagen")) {{
-                            engineEl.style.background = "rgba(59, 130, 246, 0.2)";
-                            engineEl.style.color = "#60a5fa";
-                            engineEl.style.borderColor = "rgba(59, 130, 246, 0.4)";
-                        }} else {{
-                            engineEl.style.background = "rgba(168, 85, 247, 0.2)";
-                            engineEl.style.color = "#c084fc";
-                            engineEl.style.borderColor = "rgba(168, 85, 247, 0.4)";
-                        }}
-                    }}
-                    const linkEl = document.getElementById("image-result-link");
-                    linkEl.href = imgUrl;
-                    linkEl.innerText = imgUrl;
-                    document.getElementById("image-download-btn").href = imgUrl;
-                    resultBox.style.display = "block";
-                    showToast("✨ 图像生成成功 (" + engineUsed + ")！", "success");
-                }} catch (err) {{
-                    showToast("❌ 图像生成失败: " + err.message, "error");
-                }} finally {{
-                    btn.disabled = false;
-                    btn.style.opacity = "1";
-                    loading.style.display = "none";
-                }}
-            }}
-
-            let currentModalProvider = null;
-
-            function openModelsModal(provName) {{
-                currentModalProvider = providers.find(p => p.name === provName);
-                if (!currentModalProvider) return;
-                const modal = document.getElementById("models-modal");
-                document.getElementById("modal-title").innerText = `${{provName}} · 全部模型清单 (${{currentModalProvider.models ? currentModalProvider.models.length : 0}} 款)`;
-                document.getElementById("modal-search").value = "";
-                filterModalModels();
-                modal.style.display = "flex";
-            }}
-
-            function closeModelsModal() {{
-                const modal = document.getElementById("models-modal");
-                if (modal) modal.style.display = "none";
-                currentModalProvider = null;
-            }}
-
-            function filterModalModels() {{
-                if (!currentModalProvider) return;
-                const container = document.getElementById("modal-models-list");
-                const q = (document.getElementById("modal-search").value || "").toLowerCase().trim();
-                const list = (currentModalProvider.models || []).filter(m => !q || m.id.toLowerCase().includes(q) || (m.upstream_model && m.upstream_model.toLowerCase().includes(q)));
-                if (list.length === 0) {{
-                    container.innerHTML = `<div style="width:100%;text-align:center;color:var(--text-tertiary);padding:24px;">未找到匹配的模型</div>`;
-                    return;
-                }}
-                const isFlagship = (id) => {{
-                    const low = (id || "").toLowerCase();
-                    return low.includes("deepseek-v4") || low.includes("glm-5.3") || low.includes("kimi-k3") ||
-                           low.includes("nemotron-3.5") || low.includes("gemini-3.8") || low.includes("inkling");
-                }};
-                container.innerHTML = list.map(m => {{
-                    const flagship = isFlagship(m.id);
-                    const style = flagship 
-                        ? `background:rgba(94, 106, 210, 0.25);border:1px solid rgba(165, 180, 252, 0.4);color:#c7d2fe;`
-                        : ``;
-                    const prefix = flagship ? `★ ` : ``;
-                    return `<span class="badge badge-model" style="cursor:pointer;padding:4px 8px;font-size:11.5px;${{style}}" title="点击复制模型 ID" onclick="copyText('${{m.id}}')">${{prefix}}${{m.id}}</span>`;
-                }}).join("");
-            }}
-
-            function copyText(text) {{
-                if (navigator.clipboard && navigator.clipboard.writeText) {{
-                    navigator.clipboard.writeText(text).then(() => {{
-                        showToast(`已复制模型名称: <b>${{text}}</b>`, "info", 2000);
-                    }}).catch(() => {{
-                        prompt("请复制模型名称:", text);
-                    }});
-                }} else {{
-                    prompt("请复制模型名称:", text);
-                }}
-            }}
-
-            renderTable();
-            loadLogs();
-            setInterval(loadLogs, 2000);
-        </script>
-
-        <!-- 📱 全部模型查看与检索弹窗 -->
-        <div id="models-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);z-index:9999;align-items:center;justify-content:center;padding:20px;" onclick="if(event.target===this)closeModelsModal()">
-            <div style="background:#16181d;border:1px solid rgba(255,255,255,0.15);border-radius:12px;width:100%;max-width:680px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 48px rgba(0,0,0,0.6);overflow:hidden;" onclick="event.stopPropagation()">
-                <div style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:center;">
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                        <h3 id="modal-title" style="margin:0;font-size:15px;color:var(--text-primary);">渠道模型全量清单</h3>
-                    </div>
-                    <button class="btn" onclick="closeModelsModal()" style="padding:4px 8px;font-size:14px;border:none;background:transparent;color:var(--text-secondary);cursor:pointer;">✕</button>
-                </div>
-                <div style="padding:12px 20px;border-bottom:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.2);">
-                    <input type="text" id="modal-search" class="key-input" placeholder="🔍 快速搜索模型 (例如 deepseek, glm, kimi, nemotron, llama)..." oninput="filterModalModels()" style="width:100%;font-size:13px;padding:8px 12px;">
-                </div>
-                <div id="modal-models-list" style="padding:16px 20px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:8px;max-height:60vh;">
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return html
+    providers_json = json.dumps(state.harness_config.get("providers", []))
+    harness_port = state.harness_config.get("server", {}).get("port", 8000)
+    codex_port = state.codex_config.get("server", {}).get("port", 8001)
+    return get_dashboard_html(providers_json, harness_port, codex_port)
 
 # 2. 交互控制 API
 class ToggleRequest(BaseModel):
     name: str
     enabled: bool
+    channel: Optional[str] = "both"
 
 class UpdateKeyRequest(BaseModel):
     name: str
     api_key: str
+    channel: Optional[str] = "both"
 
 class DeleteProviderRequest(BaseModel):
     name: str
+    channel: Optional[str] = "both"
 
 class TestKeyRequest(BaseModel):
     name: str
+    channel: Optional[str] = "harness"
 
-@app.post("/api/providers/toggle")
+@app_harness.post("/api/providers/toggle")
 async def api_toggle_provider(req: ToggleRequest):
+    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
     updated = False
-    for p in state.config.get("providers", []):
-        if p.get("name") == req.name:
-            p["enabled"] = req.enabled
-            updated = True
-            break
-    
+    for ch in target_channels:
+        cfg = state.get_config(ch)
+        for p in cfg.get("providers", []):
+            if p.get("name") == req.name:
+                p["enabled"] = req.enabled
+                updated = True
+                save_config(cfg, channel=ch)
+                break
     if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    
-    save_config(state.config)
     state.reload_config()
     return {"status": "ok", "name": req.name, "enabled": req.enabled}
 
-@app.post("/api/providers/update_key")
+@app_harness.post("/api/providers/update_key")
 async def api_update_key(req: UpdateKeyRequest):
+    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
     updated = False
-    for p in state.config.get("providers", []):
-        if p.get("name") == req.name:
-            p["api_key"] = req.api_key
-            if req.api_key and not req.api_key.startswith("YOUR_"):
-                p["enabled"] = True
-            updated = True
-            break
-    
+    for ch in target_channels:
+        cfg = state.get_config(ch)
+        for p in cfg.get("providers", []):
+            if p.get("name") == req.name:
+                p["api_key"] = req.api_key
+                if req.api_key and not req.api_key.startswith("YOUR_"):
+                    p["enabled"] = True
+                updated = True
+                save_config(cfg, channel=ch, force_key_updates={req.name: req.api_key})
+                break
     if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    
-    save_config(state.config, force_key_updates={req.name: req.api_key})
     state.reload_config()
     return {"status": "ok", "name": req.name}
 
-@app.post("/api/providers/delete")
+@app_harness.post("/api/providers/delete")
 async def api_delete_provider(req: DeleteProviderRequest):
-    providers = state.config.get("providers", [])
-    new_providers = [p for p in providers if p.get("name") != req.name]
-    if len(new_providers) == len(providers):
+    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
+    updated = False
+    for ch in target_channels:
+        cfg = state.get_config(ch)
+        providers = cfg.get("providers", [])
+        new_providers = [p for p in providers if p.get("name") != req.name]
+        if len(new_providers) != len(providers):
+            cfg["providers"] = new_providers
+            save_config(cfg, channel=ch)
+            updated = True
+    if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    
-    state.config["providers"] = new_providers
-    save_config(state.config)
     state.reload_config()
     return {"status": "ok", "deleted": req.name}
 
-@app.get("/api/logs")
-async def api_get_logs():
-    return state.request_logs
+@app_harness.get("/api/logs")
+async def api_get_logs(channel: str = "all"):
+    if channel == "all":
+        return state.request_logs
+    return [l for l in state.request_logs if l.get("channel") == channel]
 
-@app.post("/api/logs/clear")
+@app_harness.post("/api/logs/clear")
 async def api_clear_logs():
     state.request_logs.clear()
     return {"status": "ok", "message": "Logs cleared"}
 
-@app.post("/api/providers/test")
+@app_harness.get("/api/stats")
+async def api_get_stats():
+    state._init_stats()
+    return {
+        "status": "healthy",
+        "timestamp": int(time.time()),
+        "global": {
+            "total_requests": state.stats.get("total_requests", 0),
+            "success_requests": state.stats.get("success_requests", 0),
+            "failed_requests": state.stats.get("failed_requests", 0),
+            "failover_events": state.stats.get("failover_events", 0),
+            "tier_fallback_events": state.stats.get("tier_fallback_events", 0),
+            "total_latency_sum": state.stats.get("total_latency_sum", 0),
+        },
+        "harness": state.stats.get("harness", {}),
+        "codex": state.stats.get("codex", {}),
+        "harness_port": state.harness_config.get("server", {}).get("port", 8000),
+        "codex_port": state.codex_config.get("server", {}).get("port", 8001),
+        "active_providers": {
+            "harness": [p.get("name") for p in state.harness_config.get("providers", []) if p.get("enabled")],
+            "codex": [p.get("name") for p in state.codex_config.get("providers", []) if p.get("enabled")]
+        }
+    }
+
+@app_harness.get("/api/config/harness")
+async def api_get_harness_config():
+    if not os.path.exists(HARNESS_CONFIG_PATH):
+        _ensure_channel_configs()
+    with open(HARNESS_CONFIG_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+    return {"status": "ok", "channel": "harness", "path": HARNESS_CONFIG_PATH, "content": content}
+
+@app_harness.post("/api/config/harness")
+async def api_save_harness_config(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    content = body.get("content")
+    if not content or not isinstance(content, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'content' field")
+    try:
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("YAML content must be a dictionary")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"YAML 语法解析错误: {str(e)}")
+    
+    if os.path.exists(HARNESS_CONFIG_PATH):
+        shutil.copy2(HARNESS_CONFIG_PATH, f"{HARNESS_CONFIG_PATH}.bak")
+    with open(HARNESS_CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+    state.reload_config("harness")
+    logger.info("config.harness.yaml updated and hot-reloaded.")
+    return {"status": "ok", "message": "DeepSeek Harness 配置已成功保存并即时热重载！"}
+
+@app_harness.get("/api/config/codex")
+async def api_get_codex_config():
+    if not os.path.exists(CODEX_CONFIG_PATH):
+        _ensure_channel_configs()
+    with open(CODEX_CONFIG_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+    return {"status": "ok", "channel": "codex", "path": CODEX_CONFIG_PATH, "content": content}
+
+@app_harness.post("/api/config/codex")
+async def api_save_codex_config(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    content = body.get("content")
+    if not content or not isinstance(content, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'content' field")
+    try:
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("YAML content must be a dictionary")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"YAML 语法解析错误: {str(e)}")
+    
+    if os.path.exists(CODEX_CONFIG_PATH):
+        shutil.copy2(CODEX_CONFIG_PATH, f"{CODEX_CONFIG_PATH}.bak")
+    with open(CODEX_CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+    state.reload_config("codex")
+    logger.info("config.codex.yaml updated and hot-reloaded.")
+    return {"status": "ok", "message": "Codex CLI 配置已成功保存并即时热重载！"}
+
+@app_harness.post("/api/tools/sync-codex-config")
+async def api_sync_codex_config():
+    codex_conf_path = os.path.expanduser("~/.codex/config.toml")
+    target_port = state.codex_config.get("server", {}).get("port", 8001)
+    target_url = f"http://127.0.0.1:{target_port}/v1"
+    
+    if not os.path.exists(codex_conf_path):
+        os.makedirs(os.path.dirname(codex_conf_path), exist_ok=True)
+        default_toml = f'''model = "auto"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "FreeToken Gateway"
+base_url = "{target_url}"
+wire_api = "responses"
+'''
+        with open(codex_conf_path, "w", encoding="utf-8") as f:
+            f.write(default_toml)
+        return {
+            "status": "ok",
+            "message": f"已自动创建 ~/.codex/config.toml 并设置 base_url 为 {target_url}",
+            "base_url": target_url
+        }
+    
+    with open(codex_conf_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    shutil.copy2(codex_conf_path, f"{codex_conf_path}.bak")
+    
+    new_content, n = re.subn(
+        r'(base_url\s*=\s*["\'])http://(?:127\.0\.0\.1|localhost):\d+/v1(["\'])',
+        rf'\g<1>{target_url}\g<2>',
+        content
+    )
+    if n == 0:
+        if "base_url" in content:
+            new_content = re.sub(
+                r'(base_url\s*=\s*["\']).*?(["\'])',
+                rf'\g<1>{target_url}\g<2>',
+                content,
+                count=1
+            )
+        else:
+            new_content = content + f'\n[model_providers.custom]\nname = "FreeToken Gateway"\nbase_url = "{target_url}"\nwire_api = "responses"\n'
+
+    with open(codex_conf_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    
+    return {
+        "status": "ok",
+        "message": f"~/.codex/config.toml 已成功同步至专用端口 {target_port} ({target_url})",
+        "base_url": target_url
+    }
+
+@app_harness.post("/api/providers/test")
 async def api_test_provider(req: TestKeyRequest):
+    target_cfg = state.get_config(req.channel or "harness")
     target = None
-    for p in state.config.get("providers", []):
+    for p in target_cfg.get("providers", []):
         if p.get("name") == req.name:
             target = p
             break
@@ -2221,7 +1055,6 @@ async def api_test_provider(req: TestKeyRequest):
         headers["HTTP-Referer"] = "https://github.com/deepseek-ai/deepseek-harness"
         headers["X-Title"] = "DeepSeek-Harness"
 
-    # 针对不同大厂，优先挑选响应最快、最稳定的探活模型
     preferred_probes = {
         "Google AI Studio": ["gemini-3.5-flash", "gemini-flash-latest"],
         "Groq Cloud": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
@@ -2637,10 +1470,20 @@ async def api_update_latest_models():
         logger.error(f"Update latest models failed: {e}")
         return {"status": "error", "message": f"更新失败: {str(e)}"}
 
-# 3. 精简模型列表接口 (/v1/models) - 严格只暴露 auto 和 deepseek-v4-flash
-@app.get("/v1/models")
-async def list_models():
-    exposed = state.config.get("exposed_models", ["auto", "deepseek-v4-flash"])
+# 3. 精简模型列表接口 (/v1/models)
+@app_harness.get("/v1/models")
+@app_harness.get("/models")
+async def list_models_harness():
+    return await list_models(channel="harness")
+
+@app_codex.get("/v1/models")
+@app_codex.get("/models")
+async def list_models_codex():
+    return await list_models(channel="codex")
+
+async def list_models(channel: str = "harness"):
+    cfg = state.get_config(channel)
+    exposed = cfg.get("exposed_models", ["auto", "deepseek-v4-flash", "codex"])
     data = [
         {
             "id": mid,
@@ -2655,13 +1498,19 @@ async def list_models():
     ]
     return {"object": "list", "data": data}
 
-# 💰 兼容 DeepSeek-Harness 虚拟额度接口
-@app.get("/v1/dashboard/billing/credit_grants")
-@app.get("/dashboard/billing/credit_grants")
-@app.get("/v1/dashboard/billing/usage")
-@app.get("/dashboard/billing/usage")
-@app.get("/v1/users/current")
-@app.get("/v1/billing/subscription")
+# 💰 兼容 DeepSeek-Harness 与 Codex 虚拟额度接口
+@app_harness.get("/v1/dashboard/billing/credit_grants")
+@app_harness.get("/dashboard/billing/credit_grants")
+@app_harness.get("/v1/dashboard/billing/usage")
+@app_harness.get("/dashboard/billing/usage")
+@app_harness.get("/v1/users/current")
+@app_harness.get("/v1/billing/subscription")
+@app_codex.get("/v1/dashboard/billing/credit_grants")
+@app_codex.get("/dashboard/billing/credit_grants")
+@app_codex.get("/v1/dashboard/billing/usage")
+@app_codex.get("/dashboard/billing/usage")
+@app_codex.get("/v1/users/current")
+@app_codex.get("/v1/billing/subscription")
 async def mock_unlimited_balance():
     return {
         "object": "credit_summary",
@@ -2710,19 +1559,37 @@ def stream_peek_has_substance(peek_bytes: bytes) -> bool:
     return False
 
 # 4. 核心转发接口 (/v1/chat/completions)
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+@app_harness.post("/v1/chat/completions")
+@app_harness.post("/chat/completions")
+async def chat_completions_harness_route(request: Request):
+    return await chat_completions(request, channel="harness")
+
+@app_codex.post("/v1/chat/completions")
+@app_codex.post("/chat/completions")
+async def chat_completions_codex_route(request: Request):
+    return await chat_completions(request, channel="codex")
+
+async def chat_completions(request: Request, channel: Optional[str] = None):
+    ua = request.headers.get("user-agent", "").lower()
+    if channel:
+        eff_channel = channel
+    elif request.headers.get("x-channel") == "codex" or (request.url and request.url.port == 8001) or "codex" in ua:
+        eff_channel = "codex"
+    else:
+        eff_channel = "harness"
+
     req_time_str = time.strftime("%H:%M:%S")
     req_start_time = time.time()
     state.stats["total_requests"] += 1
+    if eff_channel in state.stats:
+        state.stats[eff_channel]["total_requests"] += 1
     
     body = await request.json()
     requested_model = body.get("model", "auto")
     is_stream = body.get("stream", False)
 
-    ua = request.headers.get("user-agent", "").lower()
-    client_tag = "DeepSeek-Harness" if ("harness" in ua or "dsh" in ua or "node" in ua) else "Chat Client"
-    logger.info(f"👉 [{client_tag} / Chat Completions Request]: model={requested_model}, is_stream={is_stream}")
+    client_tag = "Codex-CLI" if eff_channel == "codex" else ("DeepSeek-Harness" if ("harness" in ua or "dsh" in ua or "node" in ua) else "Chat Client")
+    logger.info(f"👉 [{client_tag} / Chat Completions Request ({eff_channel})]: model={requested_model}, is_stream={is_stream}")
     
     messages = body.get("messages", [])
     prompt_snippet = ""
@@ -2755,9 +1622,11 @@ async def chat_completions(request: Request):
         effective_model = "vision"
 
     has_tools = bool(forward_body.get("tools"))
-    tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image, has_tools=has_tools)
+    tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image, has_tools=has_tools, channel=eff_channel)
     if not tiered_plan:
         state.stats["failed_requests"] += 1
+        if eff_channel in state.stats:
+            state.stats[eff_channel]["failed_requests"] += 1
         return JSONResponse(
             status_code=400,
             content={
@@ -2960,6 +1829,11 @@ async def chat_completions(request: Request):
                     state.stats["total_latency_sum"] = state.stats.get("total_latency_sum", 0) + latency
                     if tier_idx > 1:
                         state.stats["tier_fallback_events"] = state.stats.get("tier_fallback_events", 0) + 1
+                    if eff_channel in state.stats:
+                        state.stats[eff_channel]["success_requests"] += 1
+                        state.stats[eff_channel]["total_latency_sum"] = state.stats[eff_channel].get("total_latency_sum", 0) + latency
+                        if tier_idx > 1:
+                            state.stats[eff_channel]["tier_fallback_events"] = state.stats[eff_channel].get("tier_fallback_events", 0) + 1
 
                     attempts_trace.append({
                         "tier": f"L{tier_idx}",
@@ -2970,6 +1844,7 @@ async def chat_completions(request: Request):
                     })
                     log_entry = {
                         "time": req_time_str,
+                        "channel": eff_channel,
                         "requested_model": requested_model,
                         "final_provider": p_name,
                         "final_model": upstream_model,
@@ -2980,7 +1855,7 @@ async def chat_completions(request: Request):
                         "prompt_snippet": prompt_snippet,
                         "attempts": attempts_trace
                     }
-                    state.add_log(log_entry)
+                    state.add_log(log_entry, channel=eff_channel)
 
                     has_tools = bool(call_body.get("tools"))
 
@@ -3305,6 +2180,11 @@ async def chat_completions(request: Request):
                     state.stats["total_latency_sum"] = state.stats.get("total_latency_sum", 0) + latency
                     if tier_idx > 1:
                         state.stats["tier_fallback_events"] = state.stats.get("tier_fallback_events", 0) + 1
+                    if eff_channel in state.stats:
+                        state.stats[eff_channel]["success_requests"] += 1
+                        state.stats[eff_channel]["total_latency_sum"] = state.stats[eff_channel].get("total_latency_sum", 0) + latency
+                        if tier_idx > 1:
+                            state.stats[eff_channel]["tier_fallback_events"] = state.stats[eff_channel].get("tier_fallback_events", 0) + 1
                     logger.info(f"✅ [{tier_name}] -> 大厂 [{p_name}] 响应成功！实际模型: [{upstream_model}] 耗时: {latency}ms")
 
                     attempts_trace.append({
@@ -3316,6 +2196,7 @@ async def chat_completions(request: Request):
                     })
                     log_entry = {
                         "time": req_time_str,
+                        "channel": eff_channel,
                         "requested_model": requested_model,
                         "final_provider": p_name,
                         "final_model": upstream_model,
@@ -3326,7 +2207,7 @@ async def chat_completions(request: Request):
                         "prompt_snippet": prompt_snippet,
                         "attempts": attempts_trace
                     }
-                    state.add_log(log_entry)
+                    state.add_log(log_entry, channel=eff_channel)
 
                     return JSONResponse(
                         content=res_json,
@@ -3363,14 +2244,19 @@ async def chat_completions(request: Request):
                 last_error_detail = error_msg
                 total_retries += 1
                 state.stats["failover_events"] += 1
+                if eff_channel in state.stats:
+                    state.stats[eff_channel]["failover_events"] += 1
                 continue
         logger.warning(f"⚠️ 【渠道商天梯 Tier {tier_idx} - {tier_name}】内所有 {len(candidates)} 个候选模型均已尝试失败或处于冷却中，自动晋级切换至下一个渠道商...")
 
     total_latency = int((time.time() - req_start_time) * 1000)
     state.stats["failed_requests"] += 1
+    if eff_channel in state.stats:
+        state.stats[eff_channel]["failed_requests"] += 1
     
     log_entry = {
         "time": req_time_str,
+        "channel": eff_channel,
         "requested_model": requested_model,
         "final_provider": "Exhausted",
         "final_model": "None",
@@ -3381,7 +2267,7 @@ async def chat_completions(request: Request):
         "prompt_snippet": prompt_snippet,
         "attempts": attempts_trace
     }
-    state.add_log(log_entry)
+    state.add_log(log_entry, channel=eff_channel)
 
     return JSONResponse(
         status_code=502,
@@ -3696,8 +2582,10 @@ async def handle_anthropic_messages(request: Request):
 # 专为 ChatGPT Codex CLI 及新一代 Agentic 工具设计，支持 instructions/input/tools
 # 双模式流式 (SSE 语义事件流) 与非流式输出
 # ==============================================================================
-@app.post("/v1/responses")
-@app.post("/responses")
+@app_codex.post("/v1/responses")
+@app_codex.post("/responses")
+@app_harness.post("/v1/responses")
+@app_harness.post("/responses")
 async def handle_openai_responses(request: Request):
     try:
         req_body = await request.json()
@@ -3878,11 +2766,11 @@ async def handle_openai_responses(request: Request):
         chat_payload["temperature"] = req_body["temperature"]
 
     auth_header = request.headers.get("Authorization", "Bearer sk-free-token")
-    headers = {"Authorization": auth_header, "Content-Type": "application/json"}
+    headers = {"Authorization": auth_header, "Content-Type": "application/json", "X-Channel": "codex"}
 
     # 1. 非流式处理 (stream: false)
     if not is_stream:
-        transport = httpx.ASGITransport(app=app)
+        transport = httpx.ASGITransport(app=app_codex)
         async with httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0) as client:
             res = await client.post("/v1/chat/completions", json=chat_payload, headers=headers)
         if res.status_code != 200:
@@ -3914,6 +2802,12 @@ async def handle_openai_responses(request: Request):
             fn = tc.get("function", {})
             fn_name = fn.get("name", "")
             fn_args = fn.get("arguments", "{}")
+            if fn_name == "apply_patch":
+                state.stats["codex"]["tool_calls"]["apply_patch"] += 1
+            elif fn_name == "exec_command":
+                state.stats["codex"]["tool_calls"]["exec_command"] += 1
+            else:
+                state.stats["codex"]["tool_calls"]["other"] += 1
             if fn_name == "apply_patch":
                 clean_patch = fn_args.strip()
                 if clean_patch.startswith("{") and clean_patch.endswith("}"):
@@ -3980,7 +2874,7 @@ async def handle_openai_responses(request: Request):
         }
         yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
 
-        transport = httpx.ASGITransport(app=app)
+        transport = httpx.ASGITransport(app=app_codex)
         internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=240.0)
 
         # 候选重试链：优先请求模型，若因上游挂起断流未产出任何有效内容，则通过同一 SSE 连接秒级无缝接力备用旗舰
@@ -4276,6 +3170,14 @@ async def handle_openai_responses(request: Request):
                     "content": [{"type": "output_text", "text": full_text}]
                 })
             for t_idx, entry in tool_calls_map.items():
+                fn_name = entry.get("name")
+                if fn_name == "apply_patch":
+                    state.stats["codex"]["tool_calls"]["apply_patch"] += 1
+                elif fn_name == "exec_command":
+                    state.stats["codex"]["tool_calls"]["exec_command"] += 1
+                else:
+                    state.stats["codex"]["tool_calls"]["other"] += 1
+
                 if entry.get("is_custom") or entry["name"] == "apply_patch":
                     final_outputs.append({
                         "id": entry["id"],
@@ -4294,6 +3196,7 @@ async def handle_openai_responses(request: Request):
                     })
 
             total_comp_tokens = max(1, len("".join(accumulated_text)) // 4)
+            state.stats["codex"]["tokens"] += 15 + total_comp_tokens
             completed_event = {
                 "type": "response.completed",
                 "response": {
@@ -4545,18 +3448,59 @@ async def create_image_generation(request: Request):
 
     return JSONResponse(status_code=200, content=result)
 
-@app.get("/v1/status")
-async def get_status():
+@app_harness.get("/v1/status")
+async def get_status_harness():
     return {
         "status": "healthy",
+        "service": "deepseek-harness",
+        "port": state.harness_config.get("server", {}).get("port", 8000),
         "timestamp": int(time.time()),
-        "stats": state.stats,
-        "config_providers": len(state.config.get("providers", [])),
+        "stats": state.stats.get("harness", {}),
+        "global_stats": state.stats,
+        "config_providers": len(state.harness_config.get("providers", [])),
         "recent_logs_count": len(state.request_logs)
     }
 
-if __name__ == "__main__":
+@app_codex.get("/v1/status")
+async def get_status_codex():
+    return {
+        "status": "healthy",
+        "service": "codex-cli",
+        "port": state.codex_config.get("server", {}).get("port", 8001),
+        "timestamp": int(time.time()),
+        "stats": state.stats.get("codex", {}),
+        "global_stats": state.stats,
+        "config_providers": len(state.codex_config.get("providers", [])),
+        "recent_logs_count": len([l for l in state.request_logs if l.get("channel") == "codex"])
+    }
+
+async def run_servers():
     import uvicorn
-    host = state.config["server"].get("host", "127.0.0.1")
-    port = state.config["server"].get("port", 8000)
-    uvicorn.run("gateway:app", host=host, port=port, reload=False)
+    host_h = state.harness_config.get("server", {}).get("host", "127.0.0.1")
+    port_h = int(state.harness_config.get("server", {}).get("port", 8000))
+
+    host_c = state.codex_config.get("server", {}).get("host", "127.0.0.1")
+    port_c = int(state.codex_config.get("server", {}).get("port", 8001))
+
+    cfg_h = uvicorn.Config(app_harness, host=host_h, port=port_h, log_level="warning")
+    cfg_c = uvicorn.Config(app_codex, host=host_c, port=port_c, log_level="warning")
+
+    server_h = uvicorn.Server(cfg_h)
+    server_c = uvicorn.Server(cfg_c)
+
+    logger.info("=" * 70)
+    logger.info("🚀 [Free Token Gateway] 双轨分离服务已并发就绪：")
+    logger.info(f"   👉 DeepSeek Harness & Web 控制台 : http://{host_h}:{port_h}")
+    logger.info(f"   👉 ChatGPT Codex CLI 专用服务    : http://{host_c}:{port_c}")
+    logger.info("=" * 70)
+
+    await asyncio.gather(
+        server_h.serve(),
+        server_c.serve()
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_servers())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Gateway servers gracefully stopped.")

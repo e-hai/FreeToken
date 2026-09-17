@@ -77,6 +77,7 @@ vision "<图片文件路径>" "<你的具体分析要求或提问>"
 ## ChatGPT Codex CLI / Agent 接入规范 (Codex Wire API)
 
 网关已原生支持 OpenAI 2026 Responses API 适配协议 (`POST /v1/responses`)，全面兼容 ChatGPT Codex CLI 终端代码助理。
+Codex CLI 拥有专属运行端口 **8001** 与专属配置文件 `config.codex.yaml`，与 DeepSeek Harness (端口 8000) 彻底物理隔离。
 
 ### Codex CLI 配置 (`~/.codex/config.toml`)：
 ```toml
@@ -85,7 +86,8 @@ model_provider = "free_token"
 
 [model_providers.free_token]
 name = "FreeToken Gateway"
-base_url = "http://127.0.0.1:8000/v1"
+base_url = "http://127.0.0.1:8001/v1"
 wire_api = "responses"
 ```
 > 支持在 `model` 中指定 `deepseek-v4`、`codex`、`auto` 或 `gpt-5.3-codex` 等别名，全自动享受全球渠道多级故障转移容灾。
+> 可在控制台 Web 页面 (`http://127.0.0.1:8000/`) 的 **[ChatGPT Codex CLI]** 标签页中点击“一键同步”，自动完成上述配置。

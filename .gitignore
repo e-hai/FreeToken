@@ -1,5 +1,7 @@
 # Secrets & Config
 config.yaml
+config.harness.yaml
+config.codex.yaml
 
 # Python
 __pycache__/

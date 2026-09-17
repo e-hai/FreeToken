@@ -80,8 +80,9 @@ async def run_tests():
     print("🧪 开始执行 Global Free Token 网关功能与交互控制测试...")
     print("=" * 70)
 
-    # 0. 备份原始配置，确保测试结束后 100% 还原，不污染 config.yaml
-    original_config = copy.deepcopy(state.config)
+    # 0. 备份原始配置，确保测试结束后 100% 还原，不污染 config.harness.yaml / config.codex.yaml
+    original_harness = copy.deepcopy(state.harness_config)
+    original_codex = copy.deepcopy(state.codex_config)
 
     # 1. 启动 mock 上游服务器
     config = uvicorn.Config(mock_app, host="127.0.0.1", port=8999, log_level="warning")
@@ -90,30 +91,50 @@ async def run_tests():
     await asyncio.sleep(0.5)
 
     # 2. 注入模拟渠道到 gateway 内存配置中 (测试完自动清理)
-    state.config["providers"].insert(0, {
-        "name": "Mock-Primary-Exhausted",
-        "enabled": True,
-        "priority": 999,
-        "base_url": "http://127.0.0.1:8999/mock-primary",
-        "api_key": "mock-key-1",
-        "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-primary"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-primary"}]
-    })
-    state.config["providers"].insert(1, {
-        "name": "Mock-Backup-Active",
-        "enabled": True,
-        "priority": 998,
-        "base_url": "http://127.0.0.1:8999/mock-backup",
-        "api_key": "mock-key-2",
-        "models": [{"id": "deepseek-v4", "upstream_model": "mock-v4-backup"}, {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"}]
-    })
-    state.config["providers"].insert(2, {
-        "name": "Mock-Google-AI-Studio",
-        "enabled": True,
-        "priority": 997,
-        "base_url": "http://127.0.0.1:8999",
-        "api_key": "mock-google-key",
-        "models": [{"id": "imagen-3.0-generate-002", "upstream_model": "imagen-3.0-generate-002"}]
-    })
+    mock_providers = [
+        {
+            "name": "Mock-Primary-Exhausted",
+            "enabled": True,
+            "priority": 999,
+            "base_url": "http://127.0.0.1:8999/mock-primary",
+            "api_key": "mock-key-1",
+            "models": [
+                {"id": "deepseek-v4", "upstream_model": "mock-v4-primary"},
+                {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-primary"},
+                {"id": "deepseek-ai/deepseek-v4-flash-0731", "upstream_model": "mock-v4-primary"},
+                {"id": "codex", "upstream_model": "mock-v4-primary"},
+                {"id": "gpt-5.3-codex", "upstream_model": "mock-v4-primary"},
+                {"id": "auto", "upstream_model": "mock-v4-primary"}
+            ]
+        },
+        {
+            "name": "Mock-Backup-Active",
+            "enabled": True,
+            "priority": 998,
+            "base_url": "http://127.0.0.1:8999/mock-backup",
+            "api_key": "mock-key-2",
+            "models": [
+                {"id": "deepseek-v4", "upstream_model": "mock-v4-backup"},
+                {"id": "deepseek-v4-pro", "upstream_model": "mock-v4-backup"},
+                {"id": "deepseek-ai/deepseek-v4-flash-0731", "upstream_model": "mock-v4-backup"},
+                {"id": "codex", "upstream_model": "mock-v4-backup"},
+                {"id": "gpt-5.3-codex", "upstream_model": "mock-v4-backup"},
+                {"id": "auto", "upstream_model": "mock-v4-backup"}
+            ]
+        },
+        {
+            "name": "Mock-Google-AI-Studio",
+            "enabled": True,
+            "priority": 997,
+            "base_url": "http://127.0.0.1:8999",
+            "api_key": "mock-google-key",
+            "models": [{"id": "imagen-3.0-generate-002", "upstream_model": "imagen-3.0-generate-002"}]
+        }
+    ]
+
+    for p in reversed(mock_providers):
+        state.harness_config["providers"].insert(0, copy.deepcopy(p))
+        state.codex_config["providers"].insert(0, copy.deepcopy(p))
     state._init_stats()
 
     transport = httpx.ASGITransport(app=app)
@@ -327,7 +348,8 @@ async def run_tests():
         server.should_exit = True
         await mock_task
         # 100% 还原原始内存与磁盘配置，避免 Mock 污染
-        state.config = original_config
+        state.harness_config = original_harness
+        state.codex_config = original_codex
         state.reload_config()
 
 if __name__ == "__main__":

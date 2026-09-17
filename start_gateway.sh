@@ -43,8 +43,7 @@ cleanup() {
     [ -n "$HARNESS_PID" ] && kill "$HARNESS_PID" 2>/dev/null && echo "   ↳ DeepSeek-Harness (PID $HARNESS_PID) 已停止"
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null && echo "   ↳ Free Token 网关   (PID $GATEWAY_PID) 已停止"
     # 确保端口释放
-    lsof -ti :8000 2>/dev/null | xargs kill -9 2>/dev/null || true
-    lsof -ti :3080 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti :8000 -ti :8001 -ti :3080 2>/dev/null | xargs kill -9 2>/dev/null || true
     echo "👋 所有服务已关闭，再见！"
     exit 0
 }
@@ -52,17 +51,17 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # ==================== 6. 启动网关服务 (后台) ====================
 echo "=========================================================================="
-echo "⚡ Free Token 聚合网关 + DeepSeek-Harness 一体化启动器"
+echo "⚡ Free Token 双轨聚合网关 (Harness & Codex) + DeepSeek 一体化启动器"
 echo "=========================================================================="
-echo "👉 本地 OpenAI 兼容端点  : http://127.0.0.1:8000/v1"
-echo "👉 网关可视化仪表盘      : http://127.0.0.1:8000/"
-echo "👉 DeepSeek-Harness Web  : http://127.0.0.1:3080/"
-echo "👉 实时免费网页检索引擎  : http://127.0.0.1:8000/anthropic/v1/messages"
-echo "👉 配置文件              : $DIR/config.yaml"
+echo "👉 DeepSeek Harness & 控制台 : http://127.0.0.1:8000/ (API: /v1)"
+echo "👉 ChatGPT Codex CLI 专区    : http://127.0.0.1:8001/v1 (Wire: responses)"
+echo "👉 DeepSeek-Harness Web      : http://127.0.0.1:3080/"
+echo "👉 实时免费网页检索引擎      : http://127.0.0.1:8000/anthropic/v1/messages"
+echo "👉 独立配置文件              : $DIR/config.harness.yaml & config.codex.yaml"
 echo "=========================================================================="
 echo ""
 
-echo "🚀 [1/2] 正在启动 Free Token 聚合网关 (端口 8000)..."
+echo "🚀 [1/2] 正在启动 Free Token 双轨网关 (端口 8000 & 8001)..."
 python3 src/gateway.py &
 GATEWAY_PID=$!
 
