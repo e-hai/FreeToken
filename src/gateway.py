@@ -45,6 +45,8 @@ CODEX_CONFIG_PATH = os.environ.get("CONFIG_CODEX_PATH") or os.path.join(PROJECT_
 
 GENERATED_IMAGES_DIR = os.path.join(PROJECT_ROOT, "static", "generated_images")
 os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 def _ensure_channel_configs():
     base_cfg = {}
@@ -164,6 +166,121 @@ for _sub_app in [app_harness, app_codex]:
 # 保持 app 别名，兼容旧代码与测试导入
 app = app_harness
 
+def mask_secret(value: Optional[str]) -> str:
+    s = (value or "").strip()
+    if not s or s.startswith("YOUR_"):
+        return ""
+    if len(s) <= 8:
+        return "••••"
+    return f"{s[:4]}••••{s[-4:]}"
+
+def public_provider(provider: dict, reveal: bool = False) -> dict:
+    key = (provider.get("api_key") or "").strip()
+    item = dict(provider)
+    item["has_key"] = bool(key) and not key.startswith("YOUR_")
+    item["api_key_masked"] = mask_secret(key)
+    if reveal:
+        item["api_key"] = key
+    else:
+        item["api_key"] = item["api_key_masked"]
+    return item
+
+def public_providers(cfg: dict, reveal: bool = False) -> List[dict]:
+    return [public_provider(p, reveal=reveal) for p in cfg.get("providers", [])]
+
+def persist_request_log(entry: dict, channel: str):
+    ch = channel if channel in ("harness", "codex") else "global"
+    path = os.path.join(LOGS_DIR, f"{ch}.jsonl")
+    safe = {k: v for k, v in entry.items() if "key" not in str(k).lower() and "authorization" not in str(k).lower()}
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(safe, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"写入请求日志失败: {e}")
+
+def summarize_yaml_config(parsed: dict) -> dict:
+    if not isinstance(parsed, dict):
+        raise ValueError("YAML content must be a dictionary")
+    providers = parsed.get("providers") or []
+    if not isinstance(providers, list):
+        raise ValueError("providers 必须是列表")
+    enabled = []
+    disabled = []
+    models_total = 0
+    for p in providers:
+        if not isinstance(p, dict) or not p.get("name"):
+            raise ValueError("每个渠道商必须包含 name")
+        models_total += len(p.get("models") or [])
+        if p.get("enabled"):
+            enabled.append(p.get("name"))
+        else:
+            disabled.append(p.get("name"))
+    return {
+        "port": (parsed.get("server") or {}).get("port"),
+        "exposed_models": parsed.get("exposed_models") or [],
+        "provider_count": len(providers),
+        "enabled": enabled,
+        "disabled": disabled,
+        "models_total": models_total
+    }
+
+def build_dispatch_snapshot(channel: str) -> dict:
+    now = time.time()
+    last_hit = None
+    for l in state.request_logs:
+        if l.get("channel") != channel:
+            continue
+        p_name = l.get("final_provider") or l.get("provider")
+        m_name = l.get("final_model") or l.get("upstream_model")
+        if p_name and p_name not in ("Exhausted", "None") and m_name and m_name not in ("None", ""):
+            last_hit = {
+                "requested_model": l.get("requested_model", l.get("model", "auto")),
+                "provider": p_name,
+                "model": m_name,
+                "latency_ms": l.get("latency_ms", l.get("latency", 0)),
+                "status": l.get("status", ""),
+                "time": l.get("time", "")
+            }
+            break
+
+    cooldowns = []
+    for key, until in list(state.model_cooldowns.items()):
+        remaining = until - now
+        if remaining <= 0:
+            continue
+        provider, _, model = key.partition(":")
+        cooldowns.append({
+            "provider": provider,
+            "model": model,
+            "remaining_s": int(remaining)
+        })
+    cooldowns.sort(key=lambda x: x["remaining_s"], reverse=True)
+
+    queues = {}
+    for group in ("auto", "deepseek", "glm", "kimi"):
+        plan = build_tiered_execution_plan(group, has_tools=True, channel=channel)
+        items = []
+        for tier in plan:
+            for p, m in tier.get("candidates", []):
+                mk = f"{p.get('name')}:{m}"
+                cd = max(0, int(state.model_cooldowns.get(mk, 0) - now))
+                items.append({
+                    "provider": p.get("name"),
+                    "model": m,
+                    "cooldown_s": cd
+                })
+                if len(items) >= 6:
+                    break
+            if len(items) >= 6:
+                break
+        queues[group] = items
+
+    return {
+        "last_hit": last_hit,
+        "cooldowns": cooldowns[:12],
+        "queues": queues
+    }
+
 class GatewayState:
     def __init__(self):
         _ensure_channel_configs()
@@ -213,6 +330,7 @@ class GatewayState:
         self.start_time = time.time()
         self.provider_cooldowns = {}
         self.model_cooldowns = {}
+        self.provider_health = {}
         self._init_stats()
 
     def get_config(self, channel: str = "harness") -> dict:
@@ -242,6 +360,7 @@ class GatewayState:
         self.request_logs.insert(0, entry)
         if len(self.request_logs) > 300:
             self.request_logs.pop()
+        persist_request_log(entry, channel)
 
     def reload_config(self, channel: Optional[str] = None):
         mock_harness = [
@@ -283,6 +402,111 @@ def is_model_vision_capable(model_name: str) -> bool:
     if any(nv in m_lower for nv in non_vision_kws):
         return False
     return any(vk in m_lower for vk in vision_kws)
+
+# 在带 tools 的 Agent 会话里不可作为兜底的模型特征：视觉专用模型、小参数老模型，
+# 以及 tool calling 支持长期不稳定的开源系列。命中任一特征即排除出兜底队列。
+AGENT_UNSUITABLE_KEYWORDS = [
+    "vision", "omni", "nano", "gemma", "yi-large", "guard",
+    "-1b", "-2b", "-3b", "-4b", "-6.7b", "-7b", "-8b", "-9b",
+]
+
+def is_agent_capable_model(model_name: str) -> bool:
+    m_lower = model_name.lower()
+    return not any(kw in m_lower for kw in AGENT_UNSUITABLE_KEYWORDS)
+
+# OpenRouter 默认只走 :free。显式点名的旗舰（当前仅 DeepSeek V4 Pro）允许走付费端点。
+OPENROUTER_PAID_ALLOWLIST = {
+    "deepseek/deepseek-v4-pro-0813",
+}
+
+def is_openrouter_allowed_model(up_name: str) -> bool:
+    if not up_name or ":batch" in up_name:
+        return False
+    if up_name.endswith(":free") or up_name == "openrouter/free":
+        return True
+    return up_name in OPENROUTER_PAID_ALLOWLIST
+
+VISION_UNSAFE_KEYWORDS = [
+    "embed", "guard", "safeguard", "clip", "reward", "parse", "detector",
+    "nemoretriever", "phi-3", "fuyu", "kosmos", "vila", "neva",
+]
+
+def is_vision_fallback_model(model_name: str) -> bool:
+    """视觉兜底只允许 Gemini Flash 与 Llama 3.2 Vision，排除 embedding / 老旧 VLM。"""
+    m = (model_name or "").lower()
+    if not m or any(k in m for k in VISION_UNSAFE_KEYWORDS):
+        return False
+    if "gemini" in m:
+        return True
+    if "llama-3.2" in m and "vision" in m:
+        return True
+    return False
+
+def extract_image_url_from_part(part: dict) -> Optional[str]:
+    if not isinstance(part, dict):
+        return None
+    for key in ("image_url", "url", "image"):
+        val = part.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = val.get("url") or val.get("image_url") or val.get("data")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    source = part.get("source")
+    if isinstance(source, dict):
+        b64 = source.get("base64") or source.get("data")
+        if isinstance(b64, str) and b64.strip():
+            if b64.startswith("data:"):
+                return b64
+            media = source.get("media_type") or source.get("mime_type") or "image/png"
+            return f"data:{media};base64,{b64}"
+    return None
+
+def convert_responses_content(content: Any) -> Any:
+    """把 Codex Responses 的 content 转成 Chat Completions 格式，保留图片部分。"""
+    if isinstance(content, str) or content is None:
+        return content or ""
+    if not isinstance(content, list):
+        return content
+    parts: List[dict] = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = (part.get("type") or "").lower()
+        if ptype in ("input_text", "text", "output_text", "reasoning", "thought"):
+            text = part.get("text") or part.get("reasoning") or ""
+            if text:
+                parts.append({"type": "text", "text": text})
+        elif ptype in ("image_url", "input_image", "output_image", "image") or part.get("image_url") or part.get("source"):
+            url = extract_image_url_from_part(part)
+            if url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+    if not parts:
+        return ""
+    if all(p.get("type") == "text" for p in parts):
+        return "\n".join(p["text"] for p in parts)
+    return parts
+
+def messages_have_image(messages: Optional[List[dict]]) -> bool:
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get("content")
+        if isinstance(c, list):
+            for part in c:
+                if not isinstance(part, dict):
+                    continue
+                ptype = (part.get("type") or "").lower()
+                if ptype in ("image_url", "input_image", "image") or part.get("image_url"):
+                    return True
+        elif isinstance(c, str) and c.startswith("data:image"):
+            return True
+    return False
 
 INVOKE_REGEX = re.compile(r'<(?:invoke|function_call|tool_call)\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</(?:invoke|function_call|tool_call)>|$)', re.DOTALL)
 PARAM_REGEX = re.compile(r'<parameter\s+[^>]*name=["\']([^"\']+)["\'][^>]*>(.*?)(?:</parameter>|(?=<parameter)|(?=</(?:invoke|function_call|tool_call)>)|$)', re.DOTALL)
@@ -423,6 +647,8 @@ def extract_and_convert_xml_tool_calls(text: str):
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
 def build_tiered_execution_plan(requested_model: str, has_image: bool = False, has_tools: bool = False, channel: str = "harness") -> List[Dict[str, Any]]:
     req_clean = requested_model.lower().strip()
+    if has_image and req_clean not in ("vision", "vision-agent", "gemini-vision") and not is_model_vision_capable(req_clean):
+        req_clean = "vision"
     cfg = state.get_config(channel)
     providers = cfg.get("providers", [])
     active_providers = [
@@ -450,51 +676,27 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                         mid = m.get("id", "").lower()
                         up_name = m.get("upstream_model", mid)
                         if "openrouter" in p_name_lower:
-                            if not (up_name.endswith(":free") or up_name == "openrouter/free"):
-                                continue
-                            if ":batch" in up_name:
+                            if not is_openrouter_allowed_model(up_name):
                                 continue
                         if t_lower == mid or t_lower in mid or mid in t_lower or t_lower == up_name.lower():
+                            if not is_vision_fallback_model(up_name):
+                                continue
                             item = (p, up_name)
                             if item not in m_candidates and item not in tier_candidates:
                                 m_candidates.append(item)
                 m_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
                 tier_candidates.extend(m_candidates)
-            tier_candidates = tier_candidates[:10]
+            tier_candidates = [c for c in tier_candidates if is_vision_fallback_model(c[1])][:10]
             if tier_candidates:
                 plan_tiers.append({
                     "tier_name": tier_name,
                     "candidates": tier_candidates
                 })
-            return plan_tiers
+        return plan_tiers
 
     # 2. 当请求 "auto" 时，执行【渠道商首选独占容灾天梯】(单个渠道商中已配置大模型全部失败后，再去切换下一个渠道商)
     if req_clean in ["auto", "default"]:
         plan_tiers = []
-
-        if has_image:
-            # 视觉模式：专属多模态渠道天梯 (Google AI Studio 顶级视觉优先 -> NVIDIA NIM 视觉兜底)
-            vision_providers = [p for p in active_providers if any(is_model_vision_capable(m.get("id", "")) or is_model_vision_capable(m.get("upstream_model", "")) for m in p.get("models", []))]
-            vision_providers.sort(key=lambda p: p.get("priority", 50), reverse=True)
-            for p in vision_providers:
-                p_name = p.get("name", "Unknown")
-                p_priority = p.get("priority", 50)
-                v_models = []
-                for m in p.get("models", []):
-                    mid = m.get("id", "")
-                    up_name = m.get("upstream_model", mid)
-                    if not up_name or ":batch" in up_name:
-                        continue
-                    if "openrouter" in p_name.lower() and not (up_name.endswith(":free") or up_name == "openrouter/free"):
-                        continue
-                    if is_model_vision_capable(up_name) and up_name not in v_models:
-                        v_models.append(up_name)
-                if v_models:
-                    plan_tiers.append({
-                        "tier_name": f"多模态视觉渠道商天梯: [{p_name}] (优先级 {p_priority})",
-                        "candidates": [(p, m) for m in v_models]
-                    })
-            return plan_tiers
 
         # 编程与通用推理模式：单个渠道商中所有已配置模型全部失败后再切换下一个渠道商
         NON_CHAT_KEYWORDS = [
@@ -515,7 +717,9 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                 "nvidia/nemotron-3-super-120b-a12b"
             ]
             GROQ_PREFERRED = []
-            OPENROUTER_PREFERRED = []
+            OPENROUTER_PREFERRED = [
+                "deepseek/deepseek-v4-pro-0813",
+            ]
         else:
             NVIDIA_PREFERRED = [
                 "deepseek-ai/deepseek-v4-flash-0731",
@@ -525,27 +729,23 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                 "nvidia/nemotron-3.5-lightning-30b-a3b",
                 "nvidia/nemotron-3-ultra-550b-a55b",
                 "nvidia/nemotron-3-super-120b-a12b",
-                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-                "google/gemma-4-31b-it",
-                "deepseek-ai/deepseek-coder-6.7b-instruct",
-                "openai/gpt-oss-20b",
                 "minimaxai/minimax-m3",
-                "01-ai/yi-large",
-                "mistralai/mistral-large-2-instruct"
+                "mistralai/mistral-large-2-instruct",
+                "openai/gpt-oss-20b"
             ]
 
             GROQ_PREFERRED = [
                 "qwen/qwen3.8-27b",
                 "openai/gpt-oss-120b",
-                "groq/compound-mini",
                 "groq/compound",
+                "groq/compound-mini",
                 "llama-3.3-70b-versatile",
                 "qwen/qwen3.6-27b",
-                "llama-3.1-8b-instant",
                 "openai/gpt-oss-20b"
             ]
 
             OPENROUTER_PREFERRED = [
+                "deepseek/deepseek-v4-pro-0813",
                 "nvidia/nemotron-3-ultra-550b-a55b:free",
                 "nvidia/nemotron-3.5-lightning:free",
                 "cohere/north-mini-code:free",
@@ -580,7 +780,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                 if "gemini" in up_low:
                     continue
                 if "openrouter" in p_name_lower:
-                    if not (up_name.endswith(":free") or up_name == "openrouter/free"):
+                    if not is_openrouter_allowed_model(up_name):
                         continue
                 if up_name not in available_upstreams:
                     available_upstreams.append(up_name)
@@ -604,13 +804,19 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                     if u.lower() == pref_low or pref_low in u.lower() or u.lower() in pref_low
                 ]
                 for m in matched:
-                    if m not in ordered_models:
+                    # 优选表也走子串匹配，同样可能捞到同名的小参数变体
+                    if m not in ordered_models and is_agent_capable_model(m):
                         ordered_models.append(m)
 
             # 2. 将该渠道商中其它已配置的聊天/编程模型作为后备候选排入当前天梯
+            # 不做无差别兜底：视觉专用与小参数老模型多数没有 tool calling，
+            # 一旦被降级命中，Agent 客户端只会拿到纯文本而空转。
             for u in available_upstreams:
-                if u not in ordered_models:
-                    ordered_models.append(u)
+                if u in ordered_models:
+                    continue
+                if not is_agent_capable_model(u):
+                    continue
+                ordered_models.append(u)
 
             # 各渠道商严格只保留前10个性能最好的大模型
             ordered_models = ordered_models[:10]
@@ -626,14 +832,19 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
     # 3. 模型组入口：deepseek / glm / kimi 表示优先调用该家族。
     # 同组所有可用模型失败后，才按照其它家族顺序跨组容灾。
     model_group_preferences = {
+        # 只收录各家的旗舰/次旗舰。绝不放 6.7B 级别的老 coder 小模型：
+        # 它们多数不支持 tool calling，一旦被降级命中，Agent 客户端会拿不到工具调用而空转。
         "deepseek": [
+            "deepseek/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-v4-pro-0813",
+            "deepseek-v4-pro",
             "deepseek-ai/deepseek-v4-flash-0731",
             "deepseek-ai/deepseek-v4-flash",
             "deepseek/deepseek-v4-flash-0731",
             "deepseek-v4-flash-0731",
             "deepseek-v4-flash",
             "deepseek-v4",
-            "deepseek-ai/deepseek-coder-6.7b-instruct",
         ],
         "glm": [
             "z-ai/glm-5.3",
@@ -657,6 +868,9 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
         target_keys.update(model_group_preferences[selected_group])
     if "deepseek" in req_clean:
         target_keys.update([
+            "deepseek/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-v4-pro-0813",
             "deepseek-ai/deepseek-v4-flash-0731",
             "deepseek-ai/deepseek-v4-flash",
             "deepseek/deepseek-v4-flash-0731",
@@ -682,9 +896,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             up_name = m.get("upstream_model", mid)
             up_lower = up_name.lower()
             if "openrouter" in p_name_lower:
-                if not (up_name.endswith(":free") or up_name == "openrouter/free"):
-                    continue
-                if ":batch" in up_name:
+                if not is_openrouter_allowed_model(up_name):
                     continue
             
             if mid in target_keys or up_lower in target_keys:
@@ -692,6 +904,11 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                 if item not in exact_candidates:
                     exact_candidates.append(item)
             elif any(k in up_lower or (len(up_lower) > 4 and up_lower in k) for k in target_keys):
+                # 模糊命中只靠家族名子串，会把同厂的小参数老模型（如 deepseek-coder-6.7b）
+                # 一并捞进来，挤在旗舰后面成为第二顺位。队列里旗舰候选已足够兜底，
+                # 这类模型无论是否带 tools 都不该参与编程/推理调度。
+                if not is_agent_capable_model(up_name):
+                    continue
                 item = (p, up_name)
                 if item not in fuzzy_candidates and item not in exact_candidates:
                     fuzzy_candidates.append(item)
@@ -721,13 +938,16 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
         ])
         for tf in ordered_fallbacks:
             for p in active_providers:
-                if "nvidia" in p.get("name", "").lower():
-                    for m in p.get("models", []):
-                        mid = m.get("upstream_model") or m.get("id")
-                        if mid == tf:
-                            item = (p, mid)
-                            if item not in candidates:
-                                candidates.append(item)
+                p_name_lower = p.get("name", "").lower()
+                for m in p.get("models", []):
+                    mid = m.get("upstream_model") or m.get("id")
+                    if mid != tf:
+                        continue
+                    if "openrouter" in p_name_lower and not is_openrouter_allowed_model(mid):
+                        continue
+                    item = (p, mid)
+                    if item not in candidates:
+                        candidates.append(item)
 
     if not candidates:
         for p in active_providers:
@@ -761,6 +981,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             # 工具/Agent 会话：严格使用经过验证的原生 Tool Calling 旗舰模型，杜绝非工具模型导致客户端假死
             emergency_target_models = [
                 "deepseek-ai/deepseek-v4-flash-0731",
+                "deepseek/deepseek-v4-pro-0813",
                 "z-ai/glm-5.3",
                 "z-ai/glm-5.3-flash",
                 "moonshotai/kimi-k3",
@@ -798,9 +1019,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
                 mid = m.get("id", "").lower()
                 up_name = m.get("upstream_model", mid)
                 if "openrouter" in p_name_lower:
-                    if not (up_name.endswith(":free") or up_name == "openrouter/free"):
-                        continue
-                    if ":batch" in up_name:
+                    if not is_openrouter_allowed_model(up_name):
                         continue
                 if t_lower == mid or t_lower == up_name.lower() or t_lower in mid:
                     item = (p, up_name)
@@ -822,39 +1041,48 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             })
     return plans
 
-# 1. 深度复刻 Linear.app 官方设计系统控制台（单页聚合双轨三 Tab 版）
+# 1. 深度复刻 Linear.app 官方设计系统控制台（Harness / Codex 双轨独立配置）
 from dashboard_html import get_dashboard_html
 
 @app_harness.get("/", response_class=HTMLResponse)
 async def dashboard():
     state._init_stats()
-    providers_json = json.dumps(state.harness_config.get("providers", []))
+    harness_providers_json = json.dumps(public_providers(state.harness_config))
+    codex_providers_json = json.dumps(public_providers(state.codex_config))
     harness_port = state.harness_config.get("server", {}).get("port", 8000)
     codex_port = state.codex_config.get("server", {}).get("port", 8001)
-    return get_dashboard_html(providers_json, harness_port, codex_port)
+    return get_dashboard_html(harness_providers_json, codex_providers_json, harness_port, codex_port)
 
 # 2. 交互控制 API
 class ToggleRequest(BaseModel):
     name: str
     enabled: bool
-    channel: Optional[str] = "both"
+    channel: Optional[str] = "harness"
 
 class UpdateKeyRequest(BaseModel):
     name: str
     api_key: str
-    channel: Optional[str] = "both"
+    channel: Optional[str] = "harness"
 
 class DeleteProviderRequest(BaseModel):
     name: str
-    channel: Optional[str] = "both"
+    channel: Optional[str] = "harness"
 
 class TestKeyRequest(BaseModel):
     name: str
     channel: Optional[str] = "harness"
 
+def _resolve_provider_channels(channel: Optional[str]) -> List[str]:
+    ch = (channel or "harness").strip().lower()
+    if ch == "both":
+        return ["harness", "codex"]
+    if ch not in ("harness", "codex"):
+        raise HTTPException(status_code=400, detail=f"未知通道: {channel}")
+    return [ch]
+
 @app_harness.post("/api/providers/toggle")
 async def api_toggle_provider(req: ToggleRequest):
-    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
+    target_channels = _resolve_provider_channels(req.channel)
     updated = False
     for ch in target_channels:
         cfg = state.get_config(ch)
@@ -866,12 +1094,13 @@ async def api_toggle_provider(req: ToggleRequest):
                 break
     if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    state.reload_config()
-    return {"status": "ok", "name": req.name, "enabled": req.enabled}
+    for ch in target_channels:
+        state.reload_config(ch)
+    return {"status": "ok", "name": req.name, "enabled": req.enabled, "channel": target_channels}
 
 @app_harness.post("/api/providers/update_key")
 async def api_update_key(req: UpdateKeyRequest):
-    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
+    target_channels = _resolve_provider_channels(req.channel)
     updated = False
     for ch in target_channels:
         cfg = state.get_config(ch)
@@ -885,12 +1114,13 @@ async def api_update_key(req: UpdateKeyRequest):
                 break
     if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    state.reload_config()
-    return {"status": "ok", "name": req.name}
+    for ch in target_channels:
+        state.reload_config(ch)
+    return {"status": "ok", "name": req.name, "channel": target_channels}
 
 @app_harness.post("/api/providers/delete")
 async def api_delete_provider(req: DeleteProviderRequest):
-    target_channels = ["harness", "codex"] if req.channel == "both" else [req.channel or "harness"]
+    target_channels = _resolve_provider_channels(req.channel)
     updated = False
     for ch in target_channels:
         cfg = state.get_config(ch)
@@ -902,17 +1132,44 @@ async def api_delete_provider(req: DeleteProviderRequest):
             updated = True
     if not updated:
         raise HTTPException(status_code=404, detail=f"未找到渠道: {req.name}")
-    state.reload_config()
-    return {"status": "ok", "deleted": req.name}
+    for ch in target_channels:
+        state.reload_config(ch)
+    return {"status": "ok", "deleted": req.name, "channel": target_channels}
 
-@app_harness.get("/api/logs")
+@app_harness.get("/api/providers")
+async def api_list_providers(channel: str = "harness", reveal: bool = False):
+    ch = _resolve_provider_channels(channel)[0]
+    return {
+        "status": "ok",
+        "channel": ch,
+        "providers": public_providers(state.get_config(ch), reveal=reveal)
+    }
+
+@app_harness.post("/api/config/validate")
+async def api_validate_config(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    content = body.get("content")
+    if not content or not isinstance(content, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'content' field")
+    try:
+        parsed = yaml.safe_load(content)
+        summary = summarize_yaml_config(parsed)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"YAML 校验失败: {str(e)}")
+    return {"status": "ok", "summary": summary}
 async def api_get_logs(channel: str = "all"):
     if channel == "all":
         return state.request_logs
     return [l for l in state.request_logs if l.get("channel") == channel]
 
 @app_harness.post("/api/logs/clear")
-async def api_clear_logs():
+async def api_clear_logs(channel: str = "all"):
+    if channel in ("harness", "codex"):
+        state.request_logs[:] = [l for l in state.request_logs if l.get("channel") != channel]
+        return {"status": "ok", "message": f"{channel} logs cleared", "channel": channel}
     state.request_logs.clear()
     return {"status": "ok", "message": "Logs cleared"}
 
@@ -954,6 +1211,15 @@ async def api_get_stats():
         "active_providers": {
             "harness": [p.get("name") for p in state.harness_config.get("providers", []) if p.get("enabled")],
             "codex": [p.get("name") for p in state.codex_config.get("providers", []) if p.get("enabled")]
+        },
+        "providers": {
+            "harness": public_providers(state.harness_config),
+            "codex": public_providers(state.codex_config)
+        },
+        "health": state.provider_health,
+        "dispatch": {
+            "harness": build_dispatch_snapshot("harness"),
+            "codex": build_dispatch_snapshot("codex")
         }
     }
 
@@ -1077,15 +1343,18 @@ wire_api = "responses"
 
 @app_harness.post("/api/providers/test")
 async def api_test_provider(req: TestKeyRequest):
-    target_cfg = state.get_config(req.channel or "harness")
+    return await probe_provider(req.channel or "harness", req.name)
+
+async def probe_provider(channel: str, name: str) -> dict:
+    target_cfg = state.get_config(channel or "harness")
     target = None
     for p in target_cfg.get("providers", []):
-        if p.get("name") == req.name:
+        if p.get("name") == name:
             target = p
             break
     
     if not target:
-        return {"status": "error", "message": f"未找到渠道: {req.name}"}
+        return {"status": "error", "message": f"未找到渠道: {name}"}
 
     api_key = target.get("api_key", "").strip()
     if not api_key or api_key.startswith("YOUR_"):
@@ -1135,14 +1404,51 @@ async def api_test_provider(req: TestKeyRequest):
                 )
                 latency = int((time.time() - start) * 1000)
                 if resp.status_code == 200:
-                    return {"status": "ok", "latency_ms": latency, "model": test_model, "message": "测试通过"}
+                    result = {"status": "ok", "latency_ms": latency, "model": test_model, "message": "测试通过"}
+                    record_provider_health(channel, name, result)
+                    return result
                 else:
                     last_err = f"[{test_model}] {resp.status_code}: {resp.text[:80]}"
             except Exception as e:
                 last_err = f"[{test_model}] {str(e)[:80]}"
 
     latency = int((time.time() - start) * 1000)
-    return {"status": "error", "latency_ms": latency, "message": last_err}
+    result = {"status": "error", "latency_ms": latency, "message": last_err}
+    record_provider_health(channel, name, result)
+    return result
+
+def record_provider_health(channel: str, name: str, result: dict):
+    state.provider_health[f"{channel}:{name}"] = {
+        "channel": channel,
+        "name": name,
+        "status": result.get("status"),
+        "latency_ms": result.get("latency_ms"),
+        "message": result.get("message", ""),
+        "model": result.get("model", ""),
+        "checked_at": time.strftime("%H:%M:%S")
+    }
+
+async def provider_health_loop():
+    await asyncio.sleep(8)
+    while True:
+        try:
+            for ch in ("harness", "codex"):
+                for p in state.get_config(ch).get("providers", []):
+                    name = p.get("name") or ""
+                    if not name or name.startswith("Mock-") or not p.get("enabled"):
+                        continue
+                    key = (p.get("api_key") or "").strip()
+                    if not key or key.startswith("YOUR_"):
+                        record_provider_health(ch, name, {"status": "skip", "message": "无有效 Key"})
+                        continue
+                    try:
+                        await probe_provider(ch, name)
+                    except Exception as e:
+                        record_provider_health(ch, name, {"status": "error", "message": str(e)[:120]})
+                    await asyncio.sleep(0.4)
+        except Exception as e:
+            logger.warning(f"渠道巡检循环异常: {e}")
+        await asyncio.sleep(60)
 
 async def fetch_and_update_latest_free_models() -> dict:
     """
@@ -1271,6 +1577,7 @@ async def fetch_and_update_latest_free_models() -> dict:
             "llama-3.1-8b-instant"
         ],
         "OpenRouter (Global)": [
+            "deepseek/deepseek-v4-pro-0813",
             "thinkingmachines/inkling-small:free",
             "thinkingmachines/inkling:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -1677,18 +1984,8 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
 
     forward_body = dict(body)
 
-    # 智能多模态视觉嗅探：检测请求中是否包含图像输入 (image_url)
-    has_image = False
-    if messages and isinstance(messages, list):
-        for msg in messages:
-            c = msg.get("content")
-            if isinstance(c, list):
-                for part in c:
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        has_image = True
-                        break
-            if has_image:
-                break
+    # 智能多模态视觉嗅探：检测请求中是否包含图像输入
+    has_image = messages_have_image(messages)
 
     effective_model = requested_model
     if has_image and not is_model_vision_capable(requested_model):
@@ -2845,18 +3142,19 @@ async def handle_openai_responses(request: Request):
                         "tool_call_id": call_id,
                         "content": str(output)
                     })
+                elif item_type in ("input_image", "image_url", "image"):
+                    url = extract_image_url_from_part(item)
+                    if url:
+                        converted_messages.append({
+                            "role": "user",
+                            "content": [{"type": "image_url", "image_url": {"url": url}}]
+                        })
                 elif item_type == "message" or "role" in item:
                     role = item.get("role", "user")
-                    c = item.get("content", "")
-                    if isinstance(c, list):
-                        text_parts = []
-                        for part in c:
-                            if isinstance(part, dict) and part.get("type") in ("input_text", "text", "output_text", "reasoning", "thought"):
-                                text_parts.append(part.get("text", "") or part.get("reasoning", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        c = "\n".join(text_parts) if text_parts else ""
-                    converted_messages.append({"role": role, "content": c})
+                    converted_messages.append({
+                        "role": role,
+                        "content": convert_responses_content(item.get("content", ""))
+                    })
                 else:
                     converted_messages.append({"role": "user", "content": json.dumps(item)})
 
@@ -3745,10 +4043,14 @@ async def run_servers():
     logger.info(f"   👉 ChatGPT Codex CLI 专用服务    : http://{host_c}:{port_c}")
     logger.info("=" * 70)
 
-    await asyncio.gather(
-        server_h.serve(),
-        server_c.serve()
-    )
+    health_task = asyncio.create_task(provider_health_loop())
+    try:
+        await asyncio.gather(
+            server_h.serve(),
+            server_c.serve()
+        )
+    finally:
+        health_task.cancel()
 
 if __name__ == "__main__":
     try:

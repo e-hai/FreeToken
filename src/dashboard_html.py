@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Linear Dashboard HTML Generator
-提供一站式 Linear 风格三 Tab 单页控制台：
-1. 全局总览 (Dual-Channel Overview & Providers)
-2. DeepSeek Harness 专区 (Port 8000, config.harness.yaml, Logs)
-3. ChatGPT Codex CLI 专区 (Port 8001, config.codex.yaml, Tool breakdown, One-click sync)
+提供一站式 Linear 风格双 Tab 单页控制台：
+1. DeepSeek Harness 专区 (Port 8000, config.harness.yaml, 独立渠道商)
+2. ChatGPT Codex CLI 专区 (Port 8001, config.codex.yaml, 独立渠道商)
 """
 
-def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port: int = 8001) -> str:
+def get_dashboard_html(harness_providers_json: str, codex_providers_json: str, harness_port: int = 8000, codex_port: int = 8001) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -558,6 +557,62 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             border: 1px solid var(--border-card);
         }}
 
+        .card.collapsed .card-header {{ margin-bottom: 0; }}
+        .yaml-body {{ display: none; }}
+        .yaml-body.open {{ display: block; }}
+        .yaml-toggle {{
+            cursor: pointer;
+            user-select: none;
+        }}
+        .yaml-toggle:hover .card-title {{ color: #c7c9d1; }}
+        .collapse-hint {{
+            font-size: 11px;
+            color: var(--text-tertiary);
+            font-weight: 500;
+        }}
+        .queue-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 10px;
+        }}
+        .queue-box {{
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            padding: 10px 12px;
+        }}
+        .queue-title {{
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }}
+        .queue-item {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-primary);
+            line-height: 1.45;
+            margin-bottom: 4px;
+        }}
+        .cooldown {{
+            color: var(--accent-amber);
+            font-size: 10px;
+        }}
+        .log-item.fail {{
+            background: rgba(244, 63, 94, 0.08);
+            border-radius: 6px;
+            padding: 4px 6px;
+        }}
+        .key-vis-label {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }}
+
         .tab-content {{ display: none; }}
         .tab-content.active {{ display: block; }}
     </style>
@@ -567,35 +622,22 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
         <!-- 顶栏与品牌 -->
         <div class="header">
             <div class="brand">
-                <div class="brand-icon">
-                    <span class="svg-icon svg-icon-lg">
-                        <svg viewBox="0 0 24 24">
-                            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-                        </svg>
-                    </span>
-                </div>
                 <div>
                     <div class="brand-title">
                         Linear Gateway
                         <span class="brand-badge">Free Token 双轨调度</span>
                     </div>
-                    <div class="card-sub">DeepSeek-Harness & Codex CLI 物理隔离、独立配置、统一全景监控</div>
+                    <div class="card-sub">DeepSeek-Harness 与 Codex CLI 物理隔离、渠道商独立配置</div>
                 </div>
             </div>
 
-            <!-- Linear 风格 3-Tab 切换器 -->
+            <!-- Linear 风格 2-Tab 切换器 -->
             <div class="nav-tabs">
-                <button class="nav-tab-btn active" id="btn-tab-overview" onclick="switchTab('overview')">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1 4-10z"></path></svg></span>
-                    <span>全局总览</span>
-                </button>
-                <button class="nav-tab-btn" id="btn-tab-harness" onclick="switchTab('harness')">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></span>
+                <button class="nav-tab-btn active" id="btn-tab-harness" onclick="switchTab('harness')">
                     <span>DeepSeek Harness</span>
                     <span class="port-badge">:{harness_port}</span>
                 </button>
                 <button class="nav-tab-btn" id="btn-tab-codex" onclick="switchTab('codex')">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></span>
                     <span>ChatGPT Codex CLI</span>
                     <span class="port-badge">:{codex_port}</span>
                 </button>
@@ -606,221 +648,21 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                     <span class="pulse-dot"></span>
                     <span id="header-status-text">双轨并发服务正常</span>
                 </div>
-                <button class="btn btn-primary" onclick="refreshActiveTab()">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg></span>
-                    <span>刷新</span>
-                </button>
+                <button class="btn btn-primary" onclick="refreshActiveTab()">刷新</button>
             </div>
         </div>
 
         <!-- ======================================================= -->
-        <!-- TAB 1: 全局总览 (Overview)                              -->
+        <!-- TAB 1: DeepSeek Harness 专区                            -->
         <!-- ======================================================= -->
-        <div id="tab-overview" class="tab-content active">
-            <!-- 双端口服务状态概览 -->
-            <div class="channel-banner">
-                <div class="channel-banner-info">
-                    <div class="channel-badge-icon" style="background:rgba(94, 106, 210, 0.2);color:#818cf8;">⚡</div>
-                    <div>
-                        <div style="font-size:13px;font-weight:600;color:var(--text-primary);">DeepSeek Harness 代理服务</div>
-                        <div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;">
-                            端点: <span class="endpoint-pill">http://127.0.0.1:{harness_port}/v1</span>
-                            &nbsp;· 配置文件: <code>config.harness.yaml</code>
-                        </div>
-                    </div>
-                </div>
-                <div class="channel-banner-info">
-                    <div class="channel-badge-icon" style="background:rgba(16, 185, 129, 0.2);color:#34d399;">💻</div>
-                    <div>
-                        <div style="font-size:13px;font-weight:600;color:var(--text-primary);">ChatGPT Codex CLI 专用服务</div>
-                        <div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;">
-                            端点: <span class="endpoint-pill">http://127.0.0.1:{codex_port}/v1</span>
-                            &nbsp;· 配置文件: <code>config.codex.yaml</code>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Global KPI Cards -->
-            <div class="metrics-grid">
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg></span>
-                            全网总请求数
-                        </span>
-                    </div>
-                    <div class="metric-val" id="g-total-req">0</div>
-                    <div class="metric-foot">双轨流量实时汇总聚合</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-emerald);"><svg viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg></span>
-                            全局成功率
-                        </span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-emerald);" id="g-success-rate">100%</div>
-                    <div class="metric-foot" id="g-success-foot">成功 0 次 / 失败 0 次</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-violet);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                            容灾降级总数
-                        </span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-violet);" id="g-failover-count">0</div>
-                    <div class="metric-foot">故障自动跨渠道/跨梯队保活</div>
-                </div>
-                <div class="metric-box">
-                    <div class="metric-top">
-                        <span class="metric-label">
-                            <span class="svg-icon" style="color:var(--accent-amber);"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg></span>
-                            平均首字时延
-                        </span>
-                    </div>
-                    <div class="metric-val" style="color:var(--accent-amber);" id="g-avg-latency">0ms</div>
-                    <div class="metric-foot">Google / Groq 直连极速响应</div>
-                </div>
-            </div>
-
-            <!-- 最近实时命中大模型横幅卡片 -->
-            <div class="channel-banner" id="last-hit-banner" style="display:none;border-color:rgba(56, 189, 248, 0.4);background:linear-gradient(135deg, rgba(56, 189, 248, 0.08), rgba(99, 102, 241, 0.04));margin-bottom:20px;">
-                <div class="channel-banner-info">
-                    <div class="channel-badge-icon" style="background:rgba(56, 189, 248, 0.2);color:#38bdf8;">🎯</div>
-                    <div>
-                        <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;color:#38bdf8;text-transform:uppercase;">最近实时命中大模型</div>
-                        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap;">
-                            <span id="last-hit-channel" class="badge">CODEX</span>
-                            <span style="font-size:12px;color:var(--text-secondary);">客户端请求:</span>
-                            <span id="last-hit-req-model" style="font-family:'JetBrains Mono',monospace;color:#818cf8;font-weight:600;font-size:12.5px;">auto</span>
-                            <span style="color:var(--text-tertiary);">→</span>
-                            <span style="font-size:12px;color:var(--text-secondary);">命中渠道商:</span>
-                            <strong id="last-hit-provider" style="color:var(--text-primary);font-size:13px;">NVIDIA NIM</strong>
-                            <span style="font-size:12px;color:var(--text-secondary);">具体大模型:</span>
-                            <span id="last-hit-model" class="badge-model-hit">deepseek-ai/deepseek-v4-flash-0731</span>
-                        </div>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:12px;">
-                    <span id="last-hit-latency" style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--accent-amber);font-weight:700;">245ms</span>
-                    <span id="last-hit-time" style="font-size:11px;color:var(--text-tertiary);">刚刚</span>
-                </div>
-            </div>
-
-            <!-- 双轨流量对比卡片 -->
-            <div class="dual-channel-grid">
-                <div class="channel-summary-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                        <span style="font-size:13px;font-weight:600;color:#818cf8;display:flex;align-items:center;gap:6px;">
-                            ⚡ DeepSeek Harness 流量
-                        </span>
-                        <span class="badge badge-harness">Port {harness_port}</span>
-                    </div>
-                    <div style="display:flex;gap:20px;align-items:baseline;">
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">请求次数</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--text-primary);" id="ov-harness-req">0</div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">成功率</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--accent-emerald);" id="ov-harness-rate">100%</div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">平均耗时</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--accent-amber);" id="ov-harness-lat">0ms</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="channel-summary-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                        <span style="font-size:13px;font-weight:600;color:#34d399;display:flex;align-items:center;gap:6px;">
-                            💻 ChatGPT Codex CLI 流量
-                        </span>
-                        <span class="badge badge-codex">Port {codex_port}</span>
-                    </div>
-                    <div style="display:flex;gap:20px;align-items:baseline;">
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">请求次数</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--text-primary);" id="ov-codex-req">0</div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">Tool 调用</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--accent-cyan);" id="ov-codex-tools">0</div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:var(--text-secondary);">成功率</div>
-                            <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--accent-emerald);" id="ov-codex-rate">100%</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Provider 列表卡片 -->
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <div class="card-title">
-                            <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                            <span>全局上游大厂渠道矩阵</span>
-                        </div>
-                        <div class="card-sub">在此开关渠道或更新 API Key，将同步作用于双轨调度引擎</div>
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button class="btn" onclick="enableAllProviders()">全部启用</button>
-                    </div>
-                </div>
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>状态</th>
-                                <th>渠道服务商</th>
-                                <th>类别</th>
-                                <th>API Key 配置</th>
-                                <th>网络延迟</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="providers-table-body">
-                            <!-- 动态渲染 -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- 全局实时日志 -->
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <div class="card-title">
-                            <span class="svg-icon" style="color:var(--accent-cyan);"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></span>
-                            <span>全景双轨实时请求流</span>
-                        </div>
-                        <div class="card-sub">显示最近调度的所有 Harness 和 Codex 请求明细</div>
-                    </div>
-                    <button class="btn" onclick="clearLogs()">清空日志</button>
-                </div>
-                <div class="log-terminal" id="overview-log-stream">
-                    <div style="color:var(--text-tertiary);text-align:center;padding:20px;">正在监听实时流量日志...</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- ======================================================= -->
-        <!-- TAB 2: DeepSeek Harness 专区                            -->
-        <!-- ======================================================= -->
-        <div id="tab-harness" class="tab-content">
+        <div id="tab-harness" class="tab-content active">
             <!-- Harness 横幅 -->
             <div class="channel-banner" style="border-color:rgba(94, 106, 210, 0.4);">
                 <div class="channel-banner-info">
-                    <div class="channel-badge-icon" style="background:rgba(94, 106, 210, 0.25);color:#818cf8;">⚡</div>
                     <div>
                         <div style="font-size:14px;font-weight:700;color:var(--text-primary);">DeepSeek Harness 专属接入端点</div>
                         <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
-                            原生 OpenAI 协议代理 · 适配 DeepSeek 官方客户端与 Web 3080 服务
+                            原生 OpenAI 协议代理 · 适配 DeepSeek 官方客户端与 Web 3080 服务 · 独立渠道商配置
                         </div>
                     </div>
                 </div>
@@ -853,31 +695,71 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 </div>
             </div>
 
-            <!-- Harness 配置编辑器 -->
             <div class="card">
                 <div class="card-header">
                     <div>
-                        <div class="card-title">
-                            <span class="svg-icon" style="color:#818cf8;"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg></span>
-                            <span>Harness 专用配置 (<code>config.harness.yaml</code>)</span>
-                        </div>
-                        <div class="card-sub">物理独立配置文件，修改保存后即时热重载生效，不影响 Codex 渠道与别名</div>
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button class="btn" onclick="loadConfigYaml('harness')">🔄 重新读取</button>
-                        <button class="btn btn-primary" onclick="saveConfigYaml('harness')">💾 保存并即时热重载</button>
+                        <div class="card-title">调度队列</div>
+                        <div class="card-sub">最近命中、冷却中的上游，以及 auto / deepseek / glm / kimi 的优先候选</div>
                     </div>
                 </div>
-                <textarea id="harness-yaml-editor" class="yaml-editor-box" spellcheck="false" placeholder="正在加载 config.harness.yaml..."></textarea>
+                <div id="harness-dispatch"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">Harness 独立渠道商</div>
+                        <div class="card-sub">仅作用于 <code>config.harness.yaml</code>，不会改动 Codex 渠道开关与 Key</div>
+                    </div>
+                    <div style="display:flex;gap:12px;align-items:center;">
+                        <div class="key-vis-label">
+                            <span>显示 Key</span>
+                            <label class="switch">
+                                <input type="checkbox" onchange="setKeyVisibility('harness', this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <button class="btn" onclick="enableAllProviders('harness')">全部启用</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>状态</th>
+                                <th>渠道服务商</th>
+                                <th>API Key 配置</th>
+                                <th>网络延迟</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="harness-providers-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Harness 配置编辑器 -->
+            <div class="card collapsed" id="harness-yaml-card">
+                <div class="card-header yaml-toggle" onclick="toggleYamlEditor('harness')">
+                    <div>
+                        <div class="card-title">Harness 专用配置 (<code>config.harness.yaml</code>)</div>
+                        <div class="card-sub">物理独立配置文件，修改保存后即时热重载生效，不影响 Codex 渠道与别名</div>
+                    </div>
+                    <span class="collapse-hint" id="harness-yaml-toggle-hint">展开</span>
+                </div>
+                <div class="yaml-body" id="harness-yaml-body">
+                    <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px;">
+                        <button class="btn" onclick="event.stopPropagation(); loadConfigYaml('harness')">重新读取</button>
+                        <button class="btn btn-primary" onclick="event.stopPropagation(); saveConfigYaml('harness')">保存并即时热重载</button>
+                    </div>
+                    <textarea id="harness-yaml-editor" class="yaml-editor-box" spellcheck="false" placeholder="正在加载 config.harness.yaml..."></textarea>
+                </div>
             </div>
 
             <!-- Harness 专属实时日志 -->
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:#818cf8;"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></span>
-                        <span>Harness 专属链路日志 (Port {harness_port})</span>
-                    </div>
+                    <div class="card-title">Harness 专属链路日志 (Port {harness_port})</div>
                     <button class="btn" onclick="clearLogs()">清空日志</button>
                 </div>
                 <div class="log-terminal" id="harness-log-stream">
@@ -893,7 +775,6 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             <!-- Codex 横幅 -->
             <div class="channel-banner" style="border-color:rgba(16, 185, 129, 0.4);">
                 <div class="channel-banner-info">
-                    <div class="channel-badge-icon" style="background:rgba(16, 185, 129, 0.25);color:#34d399;">💻</div>
                     <div>
                         <div style="font-size:14px;font-weight:700;color:var(--text-primary);">ChatGPT Codex CLI 专属接入端点</div>
                         <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
@@ -903,10 +784,7 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 </div>
                 <div style="display:flex;align-items:center;gap:10px;">
                     <span class="endpoint-pill" style="font-size:13px;padding:6px 14px;color:#34d399;">http://127.0.0.1:{codex_port}/v1</span>
-                    <button class="btn btn-success" onclick="syncCodexConfig()">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg></span>
-                        <span>一键同步至 ~/.codex/config.toml</span>
-                    </button>
+                    <button class="btn btn-success" onclick="syncCodexConfig()">一键同步至 ~/.codex/config.toml</button>
                 </div>
             </div>
 
@@ -938,10 +816,7 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             <div class="card">
                 <div class="card-header">
                     <div>
-                        <div class="card-title">
-                            <span class="svg-icon" style="color:#34d399;"><svg viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></span>
-                            <span>Codex CLI 工具调用统计</span>
-                        </div>
+                        <div class="card-title">Codex CLI 工具调用统计</div>
                         <div class="card-sub">自动拦截并聚合 Responses Wire 协议中的 Agent 工具调用</div>
                     </div>
                 </div>
@@ -961,31 +836,71 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 </div>
             </div>
 
-            <!-- Codex 配置编辑器 -->
             <div class="card">
                 <div class="card-header">
                     <div>
-                        <div class="card-title">
-                            <span class="svg-icon" style="color:#34d399;"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg></span>
-                            <span>Codex 专用配置 (<code>config.codex.yaml</code>)</span>
-                        </div>
-                        <div class="card-sub">物理独立配置文件，定制 Codex 专属模型别名与多级保活梯队</div>
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button class="btn" onclick="loadConfigYaml('codex')">🔄 重新读取</button>
-                        <button class="btn btn-primary" onclick="saveConfigYaml('codex')">💾 保存并即时热重载</button>
+                        <div class="card-title">调度队列</div>
+                        <div class="card-sub">最近命中、冷却中的上游，以及 auto / deepseek / glm / kimi 的优先候选</div>
                     </div>
                 </div>
-                <textarea id="codex-yaml-editor" class="yaml-editor-box" spellcheck="false" placeholder="正在加载 config.codex.yaml..."></textarea>
+                <div id="codex-dispatch"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">Codex 独立渠道商</div>
+                        <div class="card-sub">仅作用于 <code>config.codex.yaml</code>，不会改动 Harness 渠道开关与 Key</div>
+                    </div>
+                    <div style="display:flex;gap:12px;align-items:center;">
+                        <div class="key-vis-label">
+                            <span>显示 Key</span>
+                            <label class="switch">
+                                <input type="checkbox" onchange="setKeyVisibility('codex', this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <button class="btn" onclick="enableAllProviders('codex')">全部启用</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>状态</th>
+                                <th>渠道服务商</th>
+                                <th>API Key 配置</th>
+                                <th>网络延迟</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="codex-providers-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Codex 配置编辑器 -->
+            <div class="card collapsed" id="codex-yaml-card">
+                <div class="card-header yaml-toggle" onclick="toggleYamlEditor('codex')">
+                    <div>
+                        <div class="card-title">Codex 专用配置 (<code>config.codex.yaml</code>)</div>
+                        <div class="card-sub">物理独立配置文件，定制 Codex 专属模型别名与多级保活梯队</div>
+                    </div>
+                    <span class="collapse-hint" id="codex-yaml-toggle-hint">展开</span>
+                </div>
+                <div class="yaml-body" id="codex-yaml-body">
+                    <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px;">
+                        <button class="btn" onclick="event.stopPropagation(); loadConfigYaml('codex')">重新读取</button>
+                        <button class="btn btn-primary" onclick="event.stopPropagation(); saveConfigYaml('codex')">保存并即时热重载</button>
+                    </div>
+                    <textarea id="codex-yaml-editor" class="yaml-editor-box" spellcheck="false" placeholder="正在加载 config.codex.yaml..."></textarea>
+                </div>
             </div>
 
             <!-- Codex 专属实时日志 -->
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">
-                        <span class="svg-icon" style="color:#34d399;"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></span>
-                        <span>Codex 专属链路日志 (Port {codex_port})</span>
-                    </div>
+                    <div class="card-title">Codex 专属链路日志 (Port {codex_port})</div>
                     <button class="btn" onclick="clearLogs()">清空日志</button>
                 </div>
                 <div class="log-terminal" id="codex-log-stream">
@@ -998,9 +913,14 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
     <div id="toast"></div>
 
     <script>
-        const initialProviders = {providers_json};
-        let activeTab = 'overview';
+        const initialProviders = {{
+            harness: {harness_providers_json},
+            codex: {codex_providers_json}
+        }};
+        let activeTab = 'harness';
         let isConfigLoaded = {{ harness: false, codex: false }};
+        let keyVisible = {{ harness: false, codex: false }};
+        let yamlOpen = {{ harness: false, codex: false }};
 
         function showToast(msg) {{
             const t = document.getElementById('toast');
@@ -1009,11 +929,17 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             setTimeout(() => {{ t.style.display = 'none'; }}, 3200);
         }}
 
+        function setText(id, value) {{
+            const el = document.getElementById(id);
+            if (el) el.innerText = value;
+        }}
+
         function switchTab(tab) {{
             activeTab = tab;
-            ['overview', 'harness', 'codex'].forEach(t => {{
+            ['harness', 'codex'].forEach(t => {{
                 const btn = document.getElementById('btn-tab-' + t);
                 const content = document.getElementById('tab-' + t);
+                if (!btn || !content) return;
                 if (t === tab) {{
                     btn.classList.add('active');
                     content.classList.add('active');
@@ -1023,27 +949,30 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 }}
             }});
 
-            if (tab === 'harness' && !isConfigLoaded.harness) {{
+            if (tab === 'harness' && yamlOpen.harness && !isConfigLoaded.harness) {{
                 loadConfigYaml('harness');
-            }} else if (tab === 'codex' && !isConfigLoaded.codex) {{
+            }} else if (tab === 'codex' && yamlOpen.codex && !isConfigLoaded.codex) {{
                 loadConfigYaml('codex');
             }}
             refreshActiveTab();
         }}
 
-        function renderProviders(providers) {{
-            const tbody = document.getElementById('providers-table-body');
+        function escapeHtml(s) {{
+            return String(s || '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+        }}
+
+        function renderProviders(providers, channel) {{
+            const tbody = document.getElementById(channel + '-providers-table-body');
             if (!tbody) return;
             tbody.innerHTML = '';
-            providers.forEach(p => {{
+            (providers || []).forEach(p => {{
                 const tr = document.createElement('tr');
                 const isEnabled = !!p.enabled;
-                const typeBadge = p.priority === 1 ? '<span class="badge" style="color:#818cf8;border-color:rgba(94,106,210,0.3);">官方大厂旗舰</span>' : '<span class="badge">快速备用</span>';
-                
+                const safeName = escapeHtml(p.name);
                 const models = (p.models || []).map(m => typeof m === 'string' ? m : (m.upstream_model || m.id || '')).filter(Boolean);
-                const modelsHtml = models.length > 0 
+                const modelsHtml = models.length > 0
                     ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">` +
-                      models.slice(0, 3).map(m => `<span class="badge" style="font-size:10px;padding:1px 6px;color:#94a3b8;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);font-family:'JetBrains Mono',monospace;">${{m}}</span>`).join('') +
+                      models.slice(0, 3).map(m => `<span class="badge" style="font-size:10px;padding:1px 6px;color:#94a3b8;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);font-family:'JetBrains Mono',monospace;">${{escapeHtml(m)}}</span>`).join('') +
                       (models.length > 3 ? `<span class="badge" style="font-size:10px;padding:1px 5px;color:var(--text-tertiary);">+${{models.length - 3}}</span>` : '') +
                       `</div>`
                     : '';
@@ -1051,30 +980,30 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 tr.innerHTML = `
                     <td>
                         <label class="switch">
-                            <input type="checkbox" ${{isEnabled ? 'checked' : ''}} onchange="toggleProvider('${{p.name}}', this.checked)">
+                            <input type="checkbox" ${{isEnabled ? 'checked' : ''}} onchange="toggleProvider('${{safeName}}', this.checked, '${{channel}}')">
                             <span class="slider"></span>
                         </label>
                     </td>
                     <td>
-                        <strong style="color:var(--text-primary);font-size:13px;">${{p.name}}</strong>
-                        <div style="font-size:10.5px;color:var(--text-tertiary);font-family:'JetBrains Mono'">${{p.base_url || 'https://api.openai.com/v1'}}</div>
+                        <strong style="color:var(--text-primary);font-size:13px;">${{safeName}}</strong>
+                        <div style="font-size:10.5px;color:var(--text-tertiary);font-family:'JetBrains Mono'">${{escapeHtml(p.base_url || 'https://api.openai.com/v1')}}</div>
                         ${{modelsHtml}}
                     </td>
-                    <td>${{typeBadge}}</td>
                     <td>
                         <div class="key-group">
-                            <input type="password" class="key-input" id="key-${{p.name}}" placeholder="sk-..." value="${{p.api_key || ''}}" />
-                            <button class="btn" style="padding:4px 8px;" onclick="updateKey('${{p.name}}')">更新</button>
+                            <input type="${{keyVisible[channel] ? 'text' : 'password'}}" class="key-input" id="key-${{channel}}-${{safeName}}" placeholder="${{escapeHtml(p.api_key_masked || '未配置')}}" value="${{escapeHtml(p.api_key || '')}}" data-masked="${{p.api_key && String(p.api_key).includes('••••') ? '1' : '0'}}" />
+                            <button class="btn" style="padding:4px 8px;" onclick="updateKey('${{safeName}}', '${{channel}}')">更新</button>
                         </div>
                     </td>
-                    <td id="lat-${{p.name}}" style="font-family:'JetBrains Mono';font-size:11.5px;color:var(--text-tertiary);">-</td>
+                    <td id="lat-${{channel}}-${{safeName}}" style="font-family:'JetBrains Mono';font-size:11.5px;color:var(--text-tertiary);">-</td>
                     <td>
-                        <button class="btn" style="padding:4px 8px;" onclick="testProviderLatency('${{p.name}}')">测速</button>
-                        <button class="btn" style="padding:4px 8px;color:var(--accent-rose);" onclick="deleteProvider('${{p.name}}')">删除</button>
+                        <button class="btn" style="padding:4px 8px;" onclick="testProviderLatency('${{safeName}}', '${{channel}}')">测速</button>
+                        <button class="btn" style="padding:4px 8px;color:var(--accent-rose);" onclick="deleteProvider('${{safeName}}', '${{channel}}')">删除</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
             }});
+            applyKeyVisibility(channel);
         }}
 
         async function fetchStats() {{
@@ -1082,22 +1011,7 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 const res = await fetch('/api/stats');
                 if (!res.ok) return;
                 const d = await res.json();
-                
-                // 全局统计
-                const g = d.global || {{}};
-                const totalReq = g.total_requests || 0;
-                const succReq = g.success_requests || 0;
-                const failReq = g.failed_requests || 0;
-                const rate = totalReq > 0 ? ((succReq / totalReq) * 100).toFixed(1) + '%' : '100%';
-                const avgLat = succReq > 0 ? Math.round((g.total_latency_sum || 0) / succReq) + 'ms' : '0ms';
 
-                document.getElementById('g-total-req').innerText = totalReq;
-                document.getElementById('g-success-rate').innerText = rate;
-                document.getElementById('g-success-foot').innerText = `成功 ${{succReq}} 次 / 失败 ${{failReq}} 次`;
-                document.getElementById('g-failover-count').innerText = (g.failover_events || 0) + (g.tier_fallback_events || 0);
-                document.getElementById('g-avg-latency').innerText = avgLat;
-
-                // Harness 统计
                 const h = d.harness || {{}};
                 const hReq = h.total_requests || 0;
                 const hSucc = h.success_requests || 0;
@@ -1105,65 +1019,33 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 const hRate = hReq > 0 ? ((hSucc / hReq) * 100).toFixed(1) + '%' : '100%';
                 const hLat = hSucc > 0 ? Math.round((h.total_latency_sum || 0) / hSucc) + 'ms' : '0ms';
 
-                document.getElementById('ov-harness-req').innerText = hReq;
-                document.getElementById('ov-harness-rate').innerText = hRate;
-                document.getElementById('ov-harness-lat').innerText = hLat;
+                setText('h-total-req', hReq);
+                setText('h-success-rate', hRate);
+                setText('h-success-foot', `成功 ${{hSucc}} / 失败 ${{hFail}}`);
+                setText('h-failover-count', (h.failover_events || 0));
+                setText('h-avg-latency', hLat);
 
-                document.getElementById('h-total-req').innerText = hReq;
-                document.getElementById('h-success-rate').innerText = hRate;
-                document.getElementById('h-success-foot').innerText = `成功 ${{hSucc}} / 失败 ${{hFail}}`;
-                document.getElementById('h-failover-count').innerText = (h.failover_events || 0);
-                document.getElementById('h-avg-latency').innerText = hLat;
-
-                // Codex 统计
                 const c = d.codex || {{}};
                 const cReq = c.total_requests || 0;
                 const cSucc = c.success_requests || 0;
                 const cRate = cReq > 0 ? ((cSucc / cReq) * 100).toFixed(1) + '%' : '100%';
-                const cTools = c.tool_calls_total || 0;
-                const cPatch = c.tool_apply_patch || 0;
-                const cExec = c.tool_exec_command || 0;
-                const cOther = Math.max(0, cTools - cPatch - cExec);
+                const tools = c.tool_calls || {{}};
+                const cPatch = tools.apply_patch || 0;
+                const cExec = tools.exec_command || 0;
+                const cOther = tools.other || 0;
+                const cTools = cPatch + cExec + cOther;
 
-                document.getElementById('ov-codex-req').innerText = cReq;
-                document.getElementById('ov-codex-tools').innerText = cTools;
-                document.getElementById('ov-codex-rate').innerText = cRate;
+                setText('c-total-req', cReq);
+                setText('c-total-tools', cTools);
+                setText('c-apply-patch', cPatch);
+                setText('c-exec-cmd', cExec);
+                setText('pill-apply-patch', cPatch);
+                setText('pill-exec-cmd', cExec);
+                setText('pill-other-tools', cOther);
 
-                document.getElementById('c-total-req').innerText = cReq;
-                document.getElementById('c-total-tools').innerText = cTools;
-                document.getElementById('c-apply-patch').innerText = cPatch;
-                document.getElementById('c-exec-cmd').innerText = cExec;
-
-                document.getElementById('pill-apply-patch').innerText = cPatch;
-                document.getElementById('pill-exec-cmd').innerText = cExec;
-                document.getElementById('pill-other-tools').innerText = cOther;
-
-                // 🎯 动态更新最近命中的大模型横幅
-                const lh = d.last_hit;
-                const banner = document.getElementById('last-hit-banner');
-                if (banner) {{
-                    if (lh && lh.model && lh.model !== 'None') {{
-                        banner.style.display = 'flex';
-                        const chEl = document.getElementById('last-hit-channel');
-                        if (chEl) {{
-                            chEl.className = lh.channel === 'codex' ? 'badge badge-codex' : 'badge badge-harness';
-                            chEl.innerText = (lh.channel || 'global').toUpperCase();
-                        }}
-                        const reqEl = document.getElementById('last-hit-req-model');
-                        if (reqEl) reqEl.innerText = lh.requested_model || 'auto';
-                        const pEl = document.getElementById('last-hit-provider');
-                        if (pEl) pEl.innerText = lh.provider || 'Gateway';
-                        const mEl = document.getElementById('last-hit-model');
-                        if (mEl) mEl.innerText = lh.model || '';
-                        const latEl = document.getElementById('last-hit-latency');
-                        if (latEl) latEl.innerText = (lh.latency_ms || 0) + 'ms';
-                        const timeEl = document.getElementById('last-hit-time');
-                        if (timeEl) timeEl.innerText = lh.time || '';
-                    }} else {{
-                        banner.style.display = 'none';
-                    }}
-                }}
-
+                renderDispatch(d.dispatch && d.dispatch.harness, 'harness');
+                renderDispatch(d.dispatch && d.dispatch.codex, 'codex');
+                applyHealth(d.health);
             }} catch (e) {{
                 console.error("fetchStats error:", e);
             }}
@@ -1171,14 +1053,11 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
 
         async function fetchLogs() {{
             try {{
-                const channel = activeTab === 'overview' ? 'all' : activeTab;
+                const channel = activeTab;
                 const res = await fetch(`/api/logs?channel=${{channel}}`);
                 if (!res.ok) return;
                 const logs = await res.json();
-                
-                const containerId = activeTab === 'overview' ? 'overview-log-stream' 
-                                  : activeTab === 'harness' ? 'harness-log-stream' 
-                                  : 'codex-log-stream';
+                const containerId = channel === 'harness' ? 'harness-log-stream' : 'codex-log-stream';
                 const el = document.getElementById(containerId);
                 if (!el) return;
 
@@ -1191,26 +1070,32 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                     const statusVal = l.status_code || (typeof l.status === 'number' ? l.status : 200);
                     const isOk = statusVal < 400;
                     const statusColor = isOk ? 'var(--accent-emerald)' : 'var(--accent-rose)';
-                    const chBadge = l.channel === 'codex' 
-                        ? '<span class="badge badge-codex">CODEX</span>' 
+                    const chBadge = l.channel === 'codex'
+                        ? '<span class="badge badge-codex">CODEX</span>'
                         : '<span class="badge badge-harness">HARNESS</span>';
                     const reqModel = l.requested_model || l.model || 'auto';
                     const hitProvider = l.final_provider || l.provider || 'Gateway';
                     const hitModel = l.final_model || l.upstream_model || '';
-                    const streamBadge = l.stream 
-                        ? '<span class="badge" style="font-size:10px;padding:1px 5px;color:#a78bfa;border-color:rgba(167,139,250,0.3);">SSE</span>' 
+                    const streamBadge = l.stream
+                        ? '<span class="badge" style="font-size:10px;padding:1px 5px;color:#a78bfa;border-color:rgba(167,139,250,0.3);">SSE</span>'
                         : '<span class="badge" style="font-size:10px;padding:1px 5px;color:#94a3b8;">REST</span>';
                     const toolsInfo = l.tool_calls ? `<span style="color:var(--accent-cyan);font-size:11px;">[Tools: ${{l.tool_calls}}]</span>` : '';
-                    
                     const hitModelPill = hitModel && hitModel !== 'None'
-                        ? `<span class="badge-model-hit" title="命中的真实大模型">🎯 ${{hitModel}}</span>`
+                        ? `<span class="badge-model-hit" title="命中的真实大模型">${{hitModel}}</span>`
                         : `<span style="color:var(--accent-rose);font-size:11px;">(未命中模型)</span>`;
 
+                    const failHint = String(l.status || '').toLowerCase().includes('fail')
+                        || String(l.status || '').toLowerCase().includes('error')
+                        || !!l.error;
+                    const rowClass = (!isOk || failHint) ? 'log-item fail' : 'log-item';
+                    const failTag = failHint ? `<span class="badge" style="color:var(--accent-rose);border-color:rgba(244,63,94,0.35);">${{escapeHtml(l.status || 'failed')}}</span>` : '';
+
                     return `
-                        <div class="log-item">
+                        <div class="${{rowClass}}">
                             <span class="log-time">${{l.time || ''}}</span>
                             ${{chBadge}}
                             <span style="color:${{statusColor}};font-weight:700;font-size:11.5px;">${{statusVal}}</span>
+                            ${{failTag}}
                             <span style="color:var(--text-secondary);font-size:11px;font-family:'JetBrains Mono';">${{l.method || 'POST'}}</span>
                             <span style="color:#818cf8;font-weight:600;font-family:'JetBrains Mono';font-size:11.5px;" title="客户端请求模型">${{reqModel}}</span>
                             <span style="color:var(--text-tertiary);font-size:11px;">→</span>
@@ -1224,6 +1109,79 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 }}).join('');
             }} catch (e) {{
                 console.error("fetchLogs error:", e);
+            }}
+        }}
+
+        async function setKeyVisibility(channel, visible) {{
+            keyVisible[channel] = !!visible;
+            try {{
+                const res = await fetch(`/api/providers?channel=${{channel}}&reveal=${{visible ? 'true' : 'false'}}`);
+                const d = await res.json();
+                if (res.ok) {{
+                    renderProviders(d.providers || [], channel);
+                    const stats = await fetch('/api/stats').then(r => r.json());
+                    applyHealth(stats.health);
+                }}
+            }} catch (e) {{
+                showToast('读取渠道商失败: ' + e.message);
+            }}
+        }}
+
+        function applyKeyVisibility(channel) {{
+            const show = !!keyVisible[channel];
+            document.querySelectorAll('#' + channel + '-providers-table-body .key-input').forEach(el => {{
+                el.type = show ? 'text' : 'password';
+            }});
+        }}
+
+        function renderDispatch(data, channel) {{
+            const el = document.getElementById(channel + '-dispatch');
+            if (!el) return;
+            const hit = (data && data.last_hit) || null;
+            const queues = (data && data.queues) || {{}};
+            const cds = (data && data.cooldowns) || [];
+            const hitHtml = hit
+                ? `<div style="margin-bottom:12px;font-size:12.5px;">最近命中: <strong>${{escapeHtml(hit.provider)}}</strong> / <span class="badge-model-hit">${{escapeHtml(hit.model)}}</span> · ${{hit.latency_ms || 0}}ms · 请求 ${{escapeHtml(hit.requested_model || '')}}</div>`
+                : `<div style="margin-bottom:12px;font-size:12px;color:var(--text-tertiary);">暂无命中记录</div>`;
+            const cdHtml = cds.length
+                ? `<div style="margin-bottom:10px;font-size:11px;color:var(--accent-amber);">冷却: ${{cds.map(c => escapeHtml(c.provider) + '/' + escapeHtml(c.model) + ' ' + c.remaining_s + 's').join(' · ')}}</div>`
+                : '';
+            const boxes = ['auto', 'deepseek', 'glm', 'kimi'].map(group => {{
+                const items = queues[group] || [];
+                const rows = items.length
+                    ? items.map((it, idx) => `<div class="queue-item">${{idx + 1}}. ${{escapeHtml(it.provider)}} / ${{escapeHtml(it.model)}}${{it.cooldown_s ? ` <span class="cooldown">${{it.cooldown_s}}s</span>` : ''}}</div>`).join('')
+                    : `<div class="queue-item" style="color:var(--text-tertiary);">暂无候选</div>`;
+                return `<div class="queue-box"><div class="queue-title">${{group}}</div>${{rows}}</div>`;
+            }}).join('');
+            el.innerHTML = hitHtml + cdHtml + `<div class="queue-grid">${{boxes}}</div>`;
+        }}
+
+        function applyHealth(health) {{
+            Object.values(health || {{}}).forEach(h => {{
+                if (!h || !h.channel || !h.name) return;
+                const el = document.getElementById(`lat-${{h.channel}}-${{h.name}}`);
+                if (!el) return;
+                if (h.status === 'ok') {{
+                    el.innerHTML = `<span style="color:var(--accent-emerald);font-weight:600;">${{h.latency_ms || 0}}ms</span>`;
+                }} else if (h.status === 'skip') {{
+                    el.innerHTML = `<span style="color:var(--text-tertiary);">未配置</span>`;
+                }} else if (h.message) {{
+                    el.innerHTML = `<span style="color:var(--accent-rose);" title="${{escapeHtml(h.message)}}">失败</span>`;
+                }}
+            }});
+        }}
+
+        function toggleYamlEditor(channel) {{
+            yamlOpen[channel] = !yamlOpen[channel];
+            const open = yamlOpen[channel];
+            const body = document.getElementById(channel + '-yaml-body');
+            const card = document.getElementById(channel + '-yaml-card');
+            const hint = document.getElementById(channel + '-yaml-toggle-hint');
+            if (body) body.classList.toggle('open', open);
+            if (card) card.classList.toggle('collapsed', !open);
+            if (hint) hint.innerText = open ? '收起' : '展开';
+            if (open && !isConfigLoaded[channel]) {{
+                loadConfigYaml(channel);
             }}
         }}
 
@@ -1247,6 +1205,24 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             if (!editor) return;
             const content = editor.value;
             try {{
+                const preview = await fetch('/api/config/validate', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ content: content }})
+                }});
+                const previewData = await preview.json();
+                if (!preview.ok) {{
+                    showToast("校验失败: " + (previewData.detail || preview.statusText));
+                    return;
+                }}
+                const s = previewData.summary || {{}};
+                const ok = confirm(
+                    `即将写入 ${{channel}} 配置并热重载。\\n` +
+                    `启用渠道 ${{(s.enabled || []).length}} 个: ${{(s.enabled || []).join(', ') || '无'}}\\n` +
+                    `停用渠道 ${{(s.disabled || []).length}} 个 · 模型条目 ${{s.models_total || 0}} · 暴露 ${{(s.exposed_models || []).join(', ')}}\\n\\n` +
+                    `确认保存？`
+                );
+                if (!ok) return;
                 const res = await fetch(`/api/config/${{channel}}`, {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
@@ -1255,6 +1231,16 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 const d = await res.json();
                 if (res.ok) {{
                     showToast(d.message || "配置已保存并即时热重载！");
+                    loadConfigYaml(channel);
+                    if (keyVisible[channel]) {{
+                        await setKeyVisibility(channel, true);
+                    }} else {{
+                        const stats = await fetch('/api/stats').then(r => r.json());
+                        if (stats.providers && stats.providers[channel]) {{
+                            renderProviders(stats.providers[channel], channel);
+                        }}
+                        applyHealth(stats.health);
+                    }}
                 }} else {{
                     showToast("保存失败: " + (d.detail || res.statusText));
                 }}
@@ -1277,47 +1263,51 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             }}
         }}
 
-        async function toggleProvider(name, enabled) {{
+        async function toggleProvider(name, enabled, channel) {{
             try {{
                 const res = await fetch('/api/providers/toggle', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ name: name, enabled: enabled, channel: 'both' }})
+                    body: JSON.stringify({{ name: name, enabled: enabled, channel: channel }})
                 }});
                 if (res.ok) {{
-                    showToast(`渠道 [${{name}}] 状态已设为: ${{enabled ? '启用' : '禁用'}}`);
+                    showToast(`[${{channel}}] 渠道 [${{name}}] 已设为: ${{enabled ? '启用' : '禁用'}}`);
                 }}
             }} catch (e) {{
                 showToast("切换失败: " + e.message);
             }}
         }}
 
-        async function updateKey(name) {{
-            const input = document.getElementById(`key-${{name}}`);
+        async function updateKey(name, channel) {{
+            const input = document.getElementById(`key-${{channel}}-${{name}}`);
             if (!input) return;
             const key = input.value.trim();
+            if (!key || key.includes('••••')) {{
+                showToast('请先打开「显示 Key」，或直接填入完整新密钥后再更新');
+                return;
+            }}
             try {{
                 const res = await fetch('/api/providers/update_key', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ name: name, api_key: key, channel: 'both' }})
+                    body: JSON.stringify({{ name: name, api_key: key, channel: channel }})
                 }});
                 if (res.ok) {{
-                    showToast(`渠道 [${{name}}] API Key 已更新`);
+                    showToast(`[${{channel}}] 渠道 [${{name}}] API Key 已更新`);
                 }}
             }} catch (e) {{
                 showToast("更新失败: " + e.message);
             }}
         }}
 
-        async function testProviderLatency(name) {{
-            const latEl = document.getElementById(`lat-${{name}}`);
+        async function testProviderLatency(name, channel) {{
+            const latEl = document.getElementById(`lat-${{channel}}-${{name}}`);
             if (latEl) latEl.innerText = '测试中...';
             try {{
                 const res = await fetch('/api/providers/test', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ name: name, channel: 'both' }})
+                    body: JSON.stringify({{ name: name, channel: channel }})
                 }});
                 const d = await res.json();
                 if (latEl) {{
@@ -1332,39 +1322,42 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             }}
         }}
 
-        async function deleteProvider(name) {{
-            if (!confirm(`确定要从双轨配置中删除渠道 [${{name}}] 吗？`)) return;
+        async function deleteProvider(name, channel) {{
+            if (!confirm(`确定要从 ${{channel}} 配置中删除渠道 [${{name}}] 吗？此操作不会影响另一条通道。`)) return;
             try {{
                 const res = await fetch('/api/providers/delete', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ name: name, channel: 'both' }})
+                    body: JSON.stringify({{ name: name, channel: channel }})
                 }});
                 if (res.ok) {{
-                    showToast(`渠道 [${{name}}] 已成功删除`);
-                    setTimeout(() => location.reload(), 800);
+                    showToast(`[${{channel}}] 渠道 [${{name}}] 已删除`);
+                    const stats = await fetch('/api/stats').then(r => r.json());
+                    if (stats.providers && stats.providers[channel]) {{
+                        renderProviders(stats.providers[channel], channel);
+                    }}
                 }}
             }} catch (e) {{
                 showToast("删除失败: " + e.message);
             }}
         }}
 
-        async function enableAllProviders() {{
-            const checkboxes = document.querySelectorAll('#providers-table-body input[type="checkbox"]');
+        async function enableAllProviders(channel) {{
+            const checkboxes = document.querySelectorAll('#' + channel + '-providers-table-body input[type="checkbox"]');
             for (let cb of checkboxes) {{
                 if (!cb.checked) {{
                     cb.checked = true;
                     cb.dispatchEvent(new Event('change'));
                 }}
             }}
-            showToast("已批量请求启用所有渠道！");
+            showToast(`已批量请求启用 ${{channel}} 全部渠道`);
         }}
 
         async function clearLogs() {{
             try {{
-                await fetch('/api/logs/clear', {{ method: 'POST' }});
+                await fetch('/api/logs/clear?channel=' + activeTab, {{ method: 'POST' }});
                 fetchLogs();
-                showToast("实时日志已清空");
+                showToast(activeTab + " 实时日志已清空");
             }} catch (e) {{}}
         }}
 
@@ -1373,8 +1366,8 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
             fetchLogs();
         }}
 
-        // 初始化
-        renderProviders(initialProviders);
+        renderProviders(initialProviders.harness, 'harness');
+        renderProviders(initialProviders.codex, 'codex');
         fetchStats();
         fetchLogs();
         setInterval(fetchStats, 3000);

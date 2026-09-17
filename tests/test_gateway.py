@@ -153,7 +153,7 @@ async def run_tests():
         # 四个入口是模型组而非单模型：显式组必须先耗尽同家族，再跨组容灾。
         from gateway import build_tiered_execution_plan
         expected_prefixes = {
-            "deepseek": ["deepseek", "deepseek"],
+            "deepseek": ["deepseek"],
             "glm": ["glm", "glm"],
             "kimi": ["kimi"],
         }
@@ -171,28 +171,109 @@ async def run_tests():
                 for prefix, model in zip(prefixes, ordered_models)
             ), f"{group} 组未被优先调度: {ordered_models[:5]}"
 
+        # 带 tools 的会话里绝不能混入视觉专用或小参数老模型：它们没有 tool calling，
+        # 一旦被降级命中，Agent 客户端只拿到纯文本，表现为“执行一段就停”。
+        from gateway import is_agent_capable_model
+        for group in ("auto", "deepseek", "glm", "kimi"):
+            plan = build_tiered_execution_plan(group, has_tools=True, channel="harness")
+            for tier in plan:
+                for provider, model in tier["candidates"]:
+                    if provider.get("name", "").startswith("Mock-"):
+                        continue
+                    assert is_agent_capable_model(model), \
+                        f"{group} 组工具队列混入了弱模型: {model}"
+
+        # 视觉任务走 Gemini Flash + Llama 3.2 Vision 专属天梯，不得混入 embedding / 老旧 VLM
+        from gateway import convert_responses_content, messages_have_image, is_vision_fallback_model
+        mixed = convert_responses_content([
+            {"type": "input_text", "text": "看这张截图"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+        ])
+        assert isinstance(mixed, list)
+        assert mixed[0]["type"] == "text" and mixed[0]["text"] == "看这张截图"
+        assert mixed[1]["type"] == "image_url"
+        assert mixed[1]["image_url"]["url"].startswith("data:image/png")
+        assert messages_have_image([{"role": "user", "content": mixed}])
+        assert not messages_have_image([{"role": "user", "content": "hello"}])
+
+        vision_plan = build_tiered_execution_plan("auto", has_tools=True, has_image=True, channel="harness")
+        vision_models = [m for tier in vision_plan for _, m in tier["candidates"]]
+        assert vision_models, "视觉队列为空"
+        assert all(is_vision_fallback_model(m) for m in vision_models), f"视觉队列混入了非旗舰模型: {vision_models}"
+        assert any("gemini" in m.lower() for m in vision_models), f"视觉队列缺少 Gemini: {vision_models}"
+        assert any("llama-3.2" in m.lower() and "vision" in m.lower() for m in vision_models), \
+            f"视觉队列缺少 Llama 3.2 Vision 兜底: {vision_models}"
+        print("✅ 模型组调度队列无弱模型混入，视觉链路完好！")
+
+        ds_models = [
+            model
+            for tier in build_tiered_execution_plan("deepseek", has_tools=True, channel="harness")
+            for provider, model in tier["candidates"]
+            if not provider.get("name", "").startswith("Mock-")
+        ]
+        assert any("v4-pro-0813" in model for model in ds_models), \
+            f"OpenRouter 的 DeepSeek V4 Pro 未进入 deepseek 组: {ds_models[:8]}"
+
         # Test 2: GET / 仪表盘
         print("\n[Test 2/6] 测试 GET / 交互式网页仪表盘...")
         res = await client.get("/")
         assert res.status_code == 200
         assert "Free Token" in res.text
         assert "switch" in res.text
+        assert "全局总览" not in res.text
+        assert "Harness 独立渠道商" in res.text
+        assert "Codex 独立渠道商" in res.text
+        assert "显示 Key" in res.text
+        assert "调度队列" in res.text
+        assert "类别" not in res.text
+        assert "<svg" not in res.text
+        for p in state.harness_config.get("providers", []) + state.codex_config.get("providers", []):
+            key = (p.get("api_key") or "").strip()
+            if key and not key.startswith("YOUR_") and len(key) > 8:
+                assert key not in res.text, "仪表盘不得下发明文 API Key"
         print("✅ 交互式网页仪表盘渲染正常！")
 
         # Test 3: POST /api/providers/toggle 开关测试 (测试真实生产渠道，验证落盘能力)
         real_providers = [p for p in state.config["providers"] if not p.get("name", "").startswith("Mock-")]
         test_provider_name = real_providers[0]["name"]
         print(f"\n[Test 3/6] 测试 POST /api/providers/toggle 渠道开关接口 (目标: {test_provider_name})...")
-        res = await client.post("/api/providers/toggle", json={"name": test_provider_name, "enabled": False})
+        codex_before = next(p.get("enabled") for p in state.codex_config["providers"] if p.get("name") == test_provider_name)
+        res = await client.post("/api/providers/toggle", json={"name": test_provider_name, "enabled": False, "channel": "harness"})
         assert res.status_code == 200
         assert res.json()["enabled"] is False
-        print(f"✅ 渠道开关切换成功 ({test_provider_name} 已设置为 False)！")
+        harness_after = next(p.get("enabled") for p in state.harness_config["providers"] if p.get("name") == test_provider_name)
+        codex_after = next(p.get("enabled") for p in state.codex_config["providers"] if p.get("name") == test_provider_name)
+        assert harness_after is False
+        assert codex_after is codex_before
+        print(f"✅ 渠道开关仅作用于 Harness ({test_provider_name} 已设置为 False)，Codex 保持 {codex_after}！")
 
         # Test 4: POST /api/providers/update_key 填写与保存 Key
         print(f"\n[Test 4/6] 测试 POST /api/providers/update_key Key 填写与持久化接口 (目标: {test_provider_name})...")
-        res = await client.post("/api/providers/update_key", json={"name": test_provider_name, "api_key": "sk-global-test-key"})
+        res = await client.post("/api/providers/update_key", json={"name": test_provider_name, "api_key": "sk-global-test-key", "channel": "harness"})
         assert res.status_code == 200
         print("✅ Key 填写与自动生效成功！")
+
+        print("\n[Test 4b] 密钥脱敏、YAML 预览与调度队列...")
+        stats_res = await client.get("/api/stats")
+        assert stats_res.status_code == 200
+        stats_json = stats_res.json()
+        assert "dispatch" in stats_json and "queues" in stats_json["dispatch"]["harness"]
+        assert "deepseek" in stats_json["dispatch"]["harness"]["queues"]
+        for ch in ("harness", "codex"):
+            for p in stats_json["providers"][ch]:
+                raw = next((x.get("api_key") for x in state.get_config(ch)["providers"] if x.get("name") == p.get("name")), "")
+                if raw and not str(raw).startswith("YOUR_") and len(str(raw)) > 8:
+                    assert p.get("api_key") != raw
+                    assert "••••" in (p.get("api_key") or p.get("api_key_masked") or "")
+        masked_list = await client.get("/api/providers", params={"channel": "harness", "reveal": False})
+        revealed_list = await client.get("/api/providers", params={"channel": "harness", "reveal": True})
+        assert masked_list.status_code == 200 and revealed_list.status_code == 200
+        bad = await client.post("/api/config/validate", json={"content": "providers: ["})
+        assert bad.status_code == 400
+        good = await client.post("/api/config/validate", json={"content": "server:\n  port: 8000\nproviders:\n- name: Demo\n  enabled: true\n  models: []\n"})
+        assert good.status_code == 200
+        assert good.json()["summary"]["enabled"] == ["Demo"]
+        print("✅ 脱敏、调度快照与 YAML 预览校验通过！")
 
         # Test 5: POST /v1/chat/completions (非流式 + 故障转移测试)
         print("\n[Test 5/6] 测试 POST /v1/chat/completions (非流式 + 自动故障转移)...")

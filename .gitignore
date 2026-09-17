@@ -17,7 +17,7 @@ env/
 # Backups & Temp files
 *.bak
 *.tmp
-*.log
+logs/
 deepseek_v4_test_result.json
 static/generated_images/*
 !static/generated_images/.gitkeep
