@@ -473,6 +473,17 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
         .log-item:hover {{ background: rgba(255, 255, 255, 0.03); }}
         .log-time {{ color: var(--text-tertiary); font-size: 10.5px; flex-shrink: 0; }}
 
+        .badge-model-hit {{
+            background: rgba(56, 189, 248, 0.12);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 7px;
+            border-radius: 4px;
+        }}
+
         /* YAML 配置文件在线编辑器 */
         .yaml-editor-box {{
             width: 100%;
@@ -671,6 +682,30 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                     </div>
                     <div class="metric-val" style="color:var(--accent-amber);" id="g-avg-latency">0ms</div>
                     <div class="metric-foot">Google / Groq 直连极速响应</div>
+                </div>
+            </div>
+
+            <!-- 最近实时命中大模型横幅卡片 -->
+            <div class="channel-banner" id="last-hit-banner" style="display:none;border-color:rgba(56, 189, 248, 0.4);background:linear-gradient(135deg, rgba(56, 189, 248, 0.08), rgba(99, 102, 241, 0.04));margin-bottom:20px;">
+                <div class="channel-banner-info">
+                    <div class="channel-badge-icon" style="background:rgba(56, 189, 248, 0.2);color:#38bdf8;">🎯</div>
+                    <div>
+                        <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;color:#38bdf8;text-transform:uppercase;">最近实时命中大模型</div>
+                        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap;">
+                            <span id="last-hit-channel" class="badge">CODEX</span>
+                            <span style="font-size:12px;color:var(--text-secondary);">客户端请求:</span>
+                            <span id="last-hit-req-model" style="font-family:'JetBrains Mono',monospace;color:#818cf8;font-weight:600;font-size:12.5px;">auto</span>
+                            <span style="color:var(--text-tertiary);">→</span>
+                            <span style="font-size:12px;color:var(--text-secondary);">命中渠道商:</span>
+                            <strong id="last-hit-provider" style="color:var(--text-primary);font-size:13px;">NVIDIA NIM</strong>
+                            <span style="font-size:12px;color:var(--text-secondary);">具体大模型:</span>
+                            <span id="last-hit-model" class="badge-model-hit">deepseek-ai/deepseek-v4-flash-0731</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;">
+                    <span id="last-hit-latency" style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--accent-amber);font-weight:700;">245ms</span>
+                    <span id="last-hit-time" style="font-size:11px;color:var(--text-tertiary);">刚刚</span>
                 </div>
             </div>
 
@@ -1005,6 +1040,14 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 const isEnabled = !!p.enabled;
                 const typeBadge = p.priority === 1 ? '<span class="badge" style="color:#818cf8;border-color:rgba(94,106,210,0.3);">官方大厂旗舰</span>' : '<span class="badge">快速备用</span>';
                 
+                const models = (p.models || []).map(m => typeof m === 'string' ? m : (m.upstream_model || m.id || '')).filter(Boolean);
+                const modelsHtml = models.length > 0 
+                    ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">` +
+                      models.slice(0, 3).map(m => `<span class="badge" style="font-size:10px;padding:1px 6px;color:#94a3b8;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);font-family:'JetBrains Mono',monospace;">${{m}}</span>`).join('') +
+                      (models.length > 3 ? `<span class="badge" style="font-size:10px;padding:1px 5px;color:var(--text-tertiary);">+${{models.length - 3}}</span>` : '') +
+                      `</div>`
+                    : '';
+
                 tr.innerHTML = `
                     <td>
                         <label class="switch">
@@ -1015,6 +1058,7 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                     <td>
                         <strong style="color:var(--text-primary);font-size:13px;">${{p.name}}</strong>
                         <div style="font-size:10.5px;color:var(--text-tertiary);font-family:'JetBrains Mono'">${{p.base_url || 'https://api.openai.com/v1'}}</div>
+                        ${{modelsHtml}}
                     </td>
                     <td>${{typeBadge}}</td>
                     <td>
@@ -1094,6 +1138,32 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 document.getElementById('pill-exec-cmd').innerText = cExec;
                 document.getElementById('pill-other-tools').innerText = cOther;
 
+                // 🎯 动态更新最近命中的大模型横幅
+                const lh = d.last_hit;
+                const banner = document.getElementById('last-hit-banner');
+                if (banner) {{
+                    if (lh && lh.model && lh.model !== 'None') {{
+                        banner.style.display = 'flex';
+                        const chEl = document.getElementById('last-hit-channel');
+                        if (chEl) {{
+                            chEl.className = lh.channel === 'codex' ? 'badge badge-codex' : 'badge badge-harness';
+                            chEl.innerText = (lh.channel || 'global').toUpperCase();
+                        }}
+                        const reqEl = document.getElementById('last-hit-req-model');
+                        if (reqEl) reqEl.innerText = lh.requested_model || 'auto';
+                        const pEl = document.getElementById('last-hit-provider');
+                        if (pEl) pEl.innerText = lh.provider || 'Gateway';
+                        const mEl = document.getElementById('last-hit-model');
+                        if (mEl) mEl.innerText = lh.model || '';
+                        const latEl = document.getElementById('last-hit-latency');
+                        if (latEl) latEl.innerText = (lh.latency_ms || 0) + 'ms';
+                        const timeEl = document.getElementById('last-hit-time');
+                        if (timeEl) timeEl.innerText = lh.time || '';
+                    }} else {{
+                        banner.style.display = 'none';
+                    }}
+                }}
+
             }} catch (e) {{
                 console.error("fetchStats error:", e);
             }}
@@ -1118,21 +1188,36 @@ def get_dashboard_html(providers_json: str, harness_port: int = 8000, codex_port
                 }}
 
                 el.innerHTML = logs.slice(-50).reverse().map(l => {{
-                    const isOk = l.status < 400;
+                    const statusVal = l.status_code || (typeof l.status === 'number' ? l.status : 200);
+                    const isOk = statusVal < 400;
                     const statusColor = isOk ? 'var(--accent-emerald)' : 'var(--accent-rose)';
                     const chBadge = l.channel === 'codex' 
                         ? '<span class="badge badge-codex">CODEX</span>' 
                         : '<span class="badge badge-harness">HARNESS</span>';
-                    const toolsInfo = l.tool_calls ? `<span style="color:var(--accent-cyan);">[Tools: ${{l.tool_calls}}]</span>` : '';
+                    const reqModel = l.requested_model || l.model || 'auto';
+                    const hitProvider = l.final_provider || l.provider || 'Gateway';
+                    const hitModel = l.final_model || l.upstream_model || '';
+                    const streamBadge = l.stream 
+                        ? '<span class="badge" style="font-size:10px;padding:1px 5px;color:#a78bfa;border-color:rgba(167,139,250,0.3);">SSE</span>' 
+                        : '<span class="badge" style="font-size:10px;padding:1px 5px;color:#94a3b8;">REST</span>';
+                    const toolsInfo = l.tool_calls ? `<span style="color:var(--accent-cyan);font-size:11px;">[Tools: ${{l.tool_calls}}]</span>` : '';
+                    
+                    const hitModelPill = hitModel && hitModel !== 'None'
+                        ? `<span class="badge-model-hit" title="命中的真实大模型">🎯 ${{hitModel}}</span>`
+                        : `<span style="color:var(--accent-rose);font-size:11px;">(未命中模型)</span>`;
+
                     return `
                         <div class="log-item">
                             <span class="log-time">${{l.time || ''}}</span>
                             ${{chBadge}}
-                            <span style="color:${{statusColor}};font-weight:600;">${{l.status}}</span>
-                            <span style="color:var(--text-primary);font-weight:500;">${{l.method}} ${{l.path}}</span>
-                            <span style="color:#818cf8;">${{l.model || ''}}</span>
-                            <span style="color:var(--text-tertiary);">→ ${{l.provider || ''}}</span>
-                            <span style="color:var(--accent-amber);">${{l.latency || 0}}ms</span>
+                            <span style="color:${{statusColor}};font-weight:700;font-size:11.5px;">${{statusVal}}</span>
+                            <span style="color:var(--text-secondary);font-size:11px;font-family:'JetBrains Mono';">${{l.method || 'POST'}}</span>
+                            <span style="color:#818cf8;font-weight:600;font-family:'JetBrains Mono';font-size:11.5px;" title="客户端请求模型">${{reqModel}}</span>
+                            <span style="color:var(--text-tertiary);font-size:11px;">→</span>
+                            <span style="color:var(--text-primary);font-weight:600;font-size:11.5px;" title="命中的渠道商">${{hitProvider}}</span>
+                            ${{hitModelPill}}
+                            <span style="color:var(--accent-amber);font-family:'JetBrains Mono';font-size:11px;">${{l.latency_ms || l.latency || 0}}ms</span>
+                            ${{streamBadge}}
                             ${{toolsInfo}}
                         </div>
                     `;

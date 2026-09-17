@@ -178,6 +178,7 @@ class GatewayState:
             "failover_events": 0,
             "tier_fallback_events": 0,
             "total_latency_sum": 0,
+            "model_hits": {},
             "provider_stats": {},
             "harness": {
                 "total_requests": 0,
@@ -187,6 +188,7 @@ class GatewayState:
                 "tier_fallback_events": 0,
                 "total_latency_sum": 0,
                 "tokens": 0,
+                "model_hits": {},
                 "provider_stats": {}
             },
             "codex": {
@@ -197,6 +199,7 @@ class GatewayState:
                 "tier_fallback_events": 0,
                 "total_latency_sum": 0,
                 "tokens": 0,
+                "model_hits": {},
                 "tool_calls": {
                     "apply_patch": 0,
                     "exec_command": 0,
@@ -888,6 +891,21 @@ async def api_clear_logs():
 @app_harness.get("/api/stats")
 async def api_get_stats():
     state._init_stats()
+    last_hit = None
+    for l in state.request_logs:
+        p_name = l.get("final_provider") or l.get("provider")
+        m_name = l.get("final_model") or l.get("upstream_model")
+        if p_name and p_name not in ("Exhausted", "None") and m_name and m_name not in ("None", ""):
+            last_hit = {
+                "channel": l.get("channel", "global"),
+                "requested_model": l.get("requested_model", l.get("model", "auto")),
+                "provider": p_name,
+                "model": m_name,
+                "latency_ms": l.get("latency_ms", l.get("latency", 0)),
+                "time": l.get("time", "")
+            }
+            break
+
     return {
         "status": "healthy",
         "timestamp": int(time.time()),
@@ -898,9 +916,11 @@ async def api_get_stats():
             "failover_events": state.stats.get("failover_events", 0),
             "tier_fallback_events": state.stats.get("tier_fallback_events", 0),
             "total_latency_sum": state.stats.get("total_latency_sum", 0),
+            "model_hits": state.stats.get("model_hits", {}),
         },
         "harness": state.stats.get("harness", {}),
         "codex": state.stats.get("codex", {}),
+        "last_hit": last_hit,
         "harness_port": state.harness_config.get("server", {}).get("port", 8000),
         "codex_port": state.codex_config.get("server", {}).get("port", 8001),
         "active_providers": {
@@ -1835,6 +1855,15 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         if tier_idx > 1:
                             state.stats[eff_channel]["tier_fallback_events"] = state.stats[eff_channel].get("tier_fallback_events", 0) + 1
 
+                    hit_key = f"{p_name} / {upstream_model}"
+                    state.stats.setdefault("model_hits", {})
+                    state.stats["model_hits"][hit_key] = state.stats["model_hits"].get(hit_key, 0) + 1
+                    if eff_channel in state.stats:
+                        state.stats[eff_channel].setdefault("model_hits", {})
+                        state.stats[eff_channel]["model_hits"][hit_key] = state.stats[eff_channel]["model_hits"].get(hit_key, 0) + 1
+
+                    logger.info(f"✨ [{tier_name}] -> 成功命中渠道商 [{p_name}] 的大模型 [{upstream_model}]！首包耗时: {latency}ms (总耗时: {total_latency}ms)")
+
                     attempts_trace.append({
                         "tier": f"L{tier_idx}",
                         "provider": p_name,
@@ -1846,12 +1875,18 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         "time": req_time_str,
                         "channel": eff_channel,
                         "requested_model": requested_model,
+                        "model": requested_model,
                         "final_provider": p_name,
+                        "provider": p_name,
                         "final_model": upstream_model,
+                        "upstream_model": upstream_model,
                         "status": "success" if total_retries == 0 else "failover_success",
                         "status_code": 200,
                         "latency_ms": total_latency,
+                        "latency": total_latency,
                         "stream": True,
+                        "method": "POST",
+                        "path": "/v1/chat/completions" if eff_channel == "harness" else "/v1/responses",
                         "prompt_snippet": prompt_snippet,
                         "attempts": attempts_trace
                     }
@@ -2185,7 +2220,15 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         state.stats[eff_channel]["total_latency_sum"] = state.stats[eff_channel].get("total_latency_sum", 0) + latency
                         if tier_idx > 1:
                             state.stats[eff_channel]["tier_fallback_events"] = state.stats[eff_channel].get("tier_fallback_events", 0) + 1
-                    logger.info(f"✅ [{tier_name}] -> 大厂 [{p_name}] 响应成功！实际模型: [{upstream_model}] 耗时: {latency}ms")
+
+                    hit_key = f"{p_name} / {upstream_model}"
+                    state.stats.setdefault("model_hits", {})
+                    state.stats["model_hits"][hit_key] = state.stats["model_hits"].get(hit_key, 0) + 1
+                    if eff_channel in state.stats:
+                        state.stats[eff_channel].setdefault("model_hits", {})
+                        state.stats[eff_channel]["model_hits"][hit_key] = state.stats[eff_channel]["model_hits"].get(hit_key, 0) + 1
+
+                    logger.info(f"✨ [{tier_name}] -> 成功命中渠道商 [{p_name}] 的大模型 [{upstream_model}]！耗时: {latency}ms")
 
                     attempts_trace.append({
                         "tier": f"L{tier_idx}",
@@ -2198,12 +2241,18 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         "time": req_time_str,
                         "channel": eff_channel,
                         "requested_model": requested_model,
+                        "model": requested_model,
                         "final_provider": p_name,
+                        "provider": p_name,
                         "final_model": upstream_model,
+                        "upstream_model": upstream_model,
                         "status": "success" if total_retries == 0 else "failover_success",
                         "status_code": 200,
                         "latency_ms": total_latency,
+                        "latency": total_latency,
                         "stream": False,
+                        "method": "POST",
+                        "path": "/v1/chat/completions" if eff_channel == "harness" else "/v1/responses",
                         "prompt_snippet": prompt_snippet,
                         "attempts": attempts_trace
                     }
@@ -2258,12 +2307,18 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
         "time": req_time_str,
         "channel": eff_channel,
         "requested_model": requested_model,
+        "model": requested_model,
         "final_provider": "Exhausted",
+        "provider": "Exhausted",
         "final_model": "None",
+        "upstream_model": "None",
         "status": "failed",
         "status_code": 502,
         "latency_ms": total_latency,
+        "latency": total_latency,
         "stream": is_stream,
+        "method": "POST",
+        "path": "/v1/chat/completions" if eff_channel == "harness" else "/v1/responses",
         "prompt_snippet": prompt_snippet,
         "attempts": attempts_trace
     }
@@ -2847,11 +2902,15 @@ async def handle_openai_responses(request: Request):
                     "arguments": fn_args
                 })
 
+        final_provider = res.headers.get("X-Gateway-Provider", "Upstream")
+        final_model = res.headers.get("X-Gateway-Model", chat_data.get("model", model))
+        logger.info(f"✨ [Responses API] 成功完成响应！客户端模型: [{model}] -> 命中渠道商 [{final_provider}] 的具体大模型 [{final_model}]")
+
         responses_data = {
             "id": resp_id,
             "object": "response",
             "created_at": int(time.time()),
-            "model": chat_data.get("model", model),
+            "model": final_model,
             "status": "completed",
             "output": output_items,
             "usage": chat_data.get("usage", {
@@ -2860,7 +2919,11 @@ async def handle_openai_responses(request: Request):
                 "total_tokens": 30
             })
         }
-        return JSONResponse(status_code=200, content=responses_data)
+        res_headers = {
+            "X-Gateway-Provider": final_provider,
+            "X-Gateway-Model": final_model
+        }
+        return JSONResponse(status_code=200, content=responses_data, headers=res_headers)
 
     # 2. 流式处理 (stream: true) -> 转换为 Responses API SSE 规范事件流
     async def stream_responses_generator():
@@ -3213,6 +3276,8 @@ async def handle_openai_responses(request: Request):
 
             total_comp_tokens = max(1, len("".join(accumulated_text)) // 4)
             state.stats["codex"]["tokens"] += 15 + total_comp_tokens
+            final_provider = upstream_res.headers.get("X-Gateway-Provider") if upstream_res else "Upstream"
+            logger.info(f"✨ [Responses API Streaming] 成功完成流式响应！客户端模型: [{model}] -> 命中渠道商 [{final_provider}] 的具体大模型 [{final_model}] (输出文本: {len(''.join(accumulated_text))} 字符, 工具调用: {len(tool_calls_map)} 个)")
             completed_event = {
                 "type": "response.completed",
                 "response": {
