@@ -105,7 +105,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="deepseek-v4", # 或 auto, codex, kimi-k3, gemini-3.8
+    model="deepseek", # 可选 auto、deepseek、glm、kimi；后三项优先调用对应模型组
     messages=[{"role": "user", "content": "你好！"}]
 )
 print(response.choices[0].message.content)

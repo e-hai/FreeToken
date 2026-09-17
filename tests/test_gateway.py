@@ -147,7 +147,29 @@ async def run_tests():
         assert res.status_code == 200
         models_data = res.json()["data"]
         model_ids = [m["id"] for m in models_data]
+        assert model_ids == ["auto", "deepseek", "glm", "kimi"]
         print(f"✅ 模型列表获取成功！包含模型数: {len(model_ids)}")
+
+        # 四个入口是模型组而非单模型：显式组必须先耗尽同家族，再跨组容灾。
+        from gateway import build_tiered_execution_plan
+        expected_prefixes = {
+            "deepseek": ["deepseek", "deepseek"],
+            "glm": ["glm", "glm"],
+            "kimi": ["kimi"],
+        }
+        for group, prefixes in expected_prefixes.items():
+            plan = build_tiered_execution_plan(group, has_tools=True, channel="harness")
+            ordered_models = [
+                model
+                for tier in plan
+                for provider, model in tier["candidates"]
+                if not provider.get("name", "").startswith("Mock-")
+            ]
+            assert len(ordered_models) >= len(prefixes)
+            assert all(
+                prefix in model.lower()
+                for prefix, model in zip(prefixes, ordered_models)
+            ), f"{group} 组未被优先调度: {ordered_models[:5]}"
 
         # Test 2: GET / 仪表盘
         print("\n[Test 2/6] 测试 GET / 交互式网页仪表盘...")

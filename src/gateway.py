@@ -623,7 +623,29 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
 
         return plan_tiers
 
-    # 2. 当请求 "deepseek-v4-flash"（或指定模型）时，大厂优先轮询目标模型，并追加紧急高可用保活层
+    # 3. 模型组入口：deepseek / glm / kimi 表示优先调用该家族。
+    # 同组所有可用模型失败后，才按照其它家族顺序跨组容灾。
+    model_group_preferences = {
+        "deepseek": [
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "deepseek-ai/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek-v4-flash-0731",
+            "deepseek-v4-flash",
+            "deepseek-v4",
+            "deepseek-ai/deepseek-coder-6.7b-instruct",
+        ],
+        "glm": [
+            "z-ai/glm-5.3",
+            "z-ai/glm-5.3-flash",
+        ],
+        "kimi": [
+            "moonshotai/kimi-k3",
+        ],
+    }
+    selected_group = req_clean if req_clean in model_group_preferences else None
+
+    # 4. 指定模型时，大厂优先轮询目标模型，并追加紧急高可用保活层
     aliases = cfg.get("model_aliases", {})
     alias_target = aliases.get(requested_model, aliases.get(req_clean, requested_model))
     target_keys = {
@@ -631,6 +653,8 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
         req_clean,
         str(alias_target).lower()
     }
+    if selected_group:
+        target_keys.update(model_group_preferences[selected_group])
     if "deepseek" in req_clean:
         target_keys.update([
             "deepseek-ai/deepseek-v4-flash-0731",
@@ -682,15 +706,19 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             candidates.append(c)
 
     if not has_image:
-        # 非视觉任务（编程与长流程 Agent 会话）：按指定大厂旗舰天梯顺序追加第一天梯高可用容灾候选
-        # 顺序严格保证：deepseek-ai -> z-ai -> moonshotai -> nvidia
-        ordered_fallbacks = [
-            "z-ai/glm-5.3",
-            "z-ai/glm-5.3-flash",
-            "moonshotai/kimi-k3",
+        # 非视觉任务：先耗尽所选家族，再按家族容灾顺序追加其它旗舰模型。
+        family_fallback_order = {
+            "deepseek": ["glm", "kimi"],
+            "glm": ["deepseek", "kimi"],
+            "kimi": ["deepseek", "glm"],
+        }
+        ordered_fallbacks = []
+        for fallback_group in family_fallback_order.get(selected_group, ["glm", "kimi"]):
+            ordered_fallbacks.extend(model_group_preferences[fallback_group])
+        ordered_fallbacks.extend([
             "nvidia/nemotron-3.5-lightning-30b-a3b",
             "nvidia/nemotron-3-ultra-550b-a55b"
-        ]
+        ])
         for tf in ordered_fallbacks:
             for p in active_providers:
                 if "nvidia" in p.get("name", "").lower():
@@ -1414,13 +1442,9 @@ async def fetch_and_update_latest_free_models() -> dict:
     }
     state.config["exposed_models"] = [
         "auto",
-        "deepseek-v4-flash",
-        "glm-5.3",
-        "glm-5.3-flash",
-        "kimi-k3",
-        "nemotron-3.5",
-        "vision",
-        "image-gen"
+        "deepseek",
+        "glm",
+        "kimi"
     ]
 
     aliases = state.config.get("model_aliases", {})
@@ -1503,7 +1527,7 @@ async def list_models_codex():
 
 async def list_models(channel: str = "harness"):
     cfg = state.get_config(channel)
-    exposed = cfg.get("exposed_models", ["auto", "deepseek-v4-flash", "codex"])
+    exposed = cfg.get("exposed_models", ["auto", "deepseek", "glm", "kimi"])
     data = [
         {
             "id": mid,

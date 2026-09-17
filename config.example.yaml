@@ -1176,4 +1176,6 @@ fallback_ladders:
     - openrouter/free
 exposed_models:
 - auto
-- deepseek-v4-flash
+- deepseek
+- glm
+- kimi
