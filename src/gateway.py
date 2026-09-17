@@ -304,7 +304,7 @@ def extract_and_convert_xml_tool_calls(text: str):
     return cleaned_text, tool_calls
 
 # 路由计划构建：仅保留 auto 与 deepseek-v4-flash
-def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -> List[Dict[str, Any]]:
+def build_tiered_execution_plan(requested_model: str, has_image: bool = False, has_tools: bool = False) -> List[Dict[str, Any]]:
     req_clean = requested_model.lower().strip()
     providers = state.config.get("providers", [])
     active_providers = [
@@ -348,7 +348,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                     "tier_name": tier_name,
                     "candidates": tier_candidates
                 })
-        return plan_tiers
+            return plan_tiers
 
     # 2. 当请求 "auto" 时，执行【渠道商首选独占容灾天梯】(单个渠道商中已配置大模型全部失败后，再去切换下一个渠道商)
     if req_clean in ["auto", "default"]:
@@ -386,45 +386,58 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             "content-safety", "translate", "creative", "med", "fin", "orpheus", "allam"
         ]
 
-        NVIDIA_PREFERRED = [
-            "moonshotai/kimi-k3",
-            "deepseek-ai/deepseek-v4-flash-0731",
-            "deepseek-ai/deepseek-v4-pro-0813",
-            "nvidia/nemotron-3-ultra-550b-a55b",
-            "nvidia/nemotron-3-super-120b-a12b",
-            "nvidia/nemotron-3.5-lightning-30b-a3b",
-            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-            "minimaxai/minimax-m3",
-            "meta/llama-3.3-70b-instruct",
-            "deepseek-ai/deepseek-coder-6.7b-instruct",
-            "mistralai/codestral-22b-instruct-v0.1",
-            "01-ai/yi-large",
-            "mistralai/mistral-large-2-instruct",
-            "google/gemma-4-31b-it"
-        ]
+        if has_tools:
+            NVIDIA_PREFERRED = [
+                "deepseek-ai/deepseek-v4-flash-0731",
+                "z-ai/glm-5.3",
+                "z-ai/glm-5.3-flash",
+                "moonshotai/kimi-k3",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b"
+            ]
+            GROQ_PREFERRED = []
+            OPENROUTER_PREFERRED = []
+        else:
+            NVIDIA_PREFERRED = [
+                "deepseek-ai/deepseek-v4-flash-0731",
+                "z-ai/glm-5.3",
+                "z-ai/glm-5.3-flash",
+                "moonshotai/kimi-k3",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                "google/gemma-4-31b-it",
+                "deepseek-ai/deepseek-coder-6.7b-instruct",
+                "openai/gpt-oss-20b",
+                "minimaxai/minimax-m3",
+                "01-ai/yi-large",
+                "mistralai/mistral-large-2-instruct"
+            ]
 
-        GROQ_PREFERRED = [
-            "qwen/qwen3.8-27b",
-            "openai/gpt-oss-120b",
-            "groq/compound-mini",
-            "groq/compound",
-            "llama-3.3-70b-versatile",
-            "qwen/qwen3.6-27b",
-            "llama-3.1-8b-instant",
-            "openai/gpt-oss-20b"
-        ]
+            GROQ_PREFERRED = [
+                "qwen/qwen3.8-27b",
+                "openai/gpt-oss-120b",
+                "groq/compound-mini",
+                "groq/compound",
+                "llama-3.3-70b-versatile",
+                "qwen/qwen3.6-27b",
+                "llama-3.1-8b-instant",
+                "openai/gpt-oss-20b"
+            ]
 
-        OPENROUTER_PREFERRED = [
-            "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "nvidia/nemotron-3.5-lightning:free",
-            "cohere/north-mini-code:free",
-            "dots-studio/dots-3-note-preview:free",
-            "minimax/minimax-m3:free",
-            "thinkingmachines/inkling:free",
-            "thinkingmachines/inkling-small:free",
-            "google/gemma-4-31b-it:free",
-            "openrouter/free"
-        ]
+            OPENROUTER_PREFERRED = [
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "nvidia/nemotron-3.5-lightning:free",
+                "cohere/north-mini-code:free",
+                "dots-studio/dots-3-note-preview:free",
+                "minimax/minimax-m3:free",
+                "thinkingmachines/inkling:free",
+                "thinkingmachines/inkling-small:free",
+                "google/gemma-4-31b-it:free",
+                "openrouter/free"
+            ]
 
         # 遍历所有活跃渠道商 (按优先级降序：NVIDIA NIM 100 > Groq Cloud 90 > OpenRouter 85)
         for p in active_providers:
@@ -550,6 +563,26 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
         if c not in candidates:
             candidates.append(c)
 
+    if not has_image:
+        # 非视觉任务（编程与长流程 Agent 会话）：按指定大厂旗舰天梯顺序追加第一天梯高可用容灾候选
+        # 顺序严格保证：deepseek-ai -> z-ai -> moonshotai -> nvidia
+        ordered_fallbacks = [
+            "z-ai/glm-5.3",
+            "z-ai/glm-5.3-flash",
+            "moonshotai/kimi-k3",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nvidia/nemotron-3-ultra-550b-a55b"
+        ]
+        for tf in ordered_fallbacks:
+            for p in active_providers:
+                if "nvidia" in p.get("name", "").lower():
+                    for m in p.get("models", []):
+                        mid = m.get("upstream_model") or m.get("id")
+                        if mid == tf:
+                            item = (p, mid)
+                            if item not in candidates:
+                                candidates.append(item)
+
     if not candidates:
         for p in active_providers:
             up_target = alias_target if alias_target != requested_model else requested_model
@@ -557,6 +590,15 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
             if item not in candidates:
                 candidates.append(item)
         candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+
+    if has_tools:
+        # 严格过滤：在工具调用模式下，坚决剔除不支持 tool calling 的模型 (如 openrouter/free, groq/compound, qwen)
+        candidates = [
+            c for c in candidates 
+            if not ("openrouter" in c[0].get("name", "").lower() and (c[1] == "openrouter/free" or c[1].endswith(":free")))
+            and "compound" not in c[1].lower()
+            and "qwen" not in c[1].lower()
+        ]
 
     plans = [{
         "tier_name": f"专属渠道轮询: {requested_model}",
@@ -569,16 +611,31 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
 
     emergency_candidates = []
     if not has_image:
-        # 编程长会话：100% 杜绝 Gemini 介入，严格使用顶级代码/推理大模型兜底
-        emergency_target_models = [
-            "moonshotai/kimi-k3",
-            "deepseek-ai/deepseek-v4-flash-0731",
-            "nvidia/nemotron-3-ultra-550b-a55b",
-            "nvidia/nemotron-3-super-120b-a12b",
-            "openai/gpt-oss-120b",
-            "qwen/qwen3.8-27b",
-            "openrouter/free"
-        ]
+        if has_tools:
+            # 工具/Agent 会话：严格使用经过验证的原生 Tool Calling 旗舰模型，杜绝非工具模型导致客户端假死
+            emergency_target_models = [
+                "deepseek-ai/deepseek-v4-flash-0731",
+                "z-ai/glm-5.3",
+                "z-ai/glm-5.3-flash",
+                "moonshotai/kimi-k3",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+            ]
+        else:
+            # 编程长会话：100% 杜绝 Gemini 介入，严格使用顶级代码/推理大模型兜底
+            emergency_target_models = [
+                "deepseek-ai/deepseek-v4-flash-0731",
+                "z-ai/glm-5.3",
+                "z-ai/glm-5.3-flash",
+                "moonshotai/kimi-k3",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "openai/gpt-oss-120b",
+                "qwen/qwen3.8-27b",
+                "openrouter/free"
+            ]
     else:
         # 视觉会话：由 Google Gemini 旗舰与开源多模态接管
         emergency_target_models = [
@@ -604,11 +661,19 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False) -
                     if item not in candidates and item not in emergency_candidates:
                         emergency_candidates.append(item)
     if emergency_candidates:
-        emergency_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
-        plans.append({
-            "tier_name": f"长流程高可用保活兜底层 (Groq LPU / Nemotron 550B 极速接管)",
-            "candidates": emergency_candidates
-        })
+        if has_tools:
+            emergency_candidates = [
+                c for c in emergency_candidates 
+                if not ("openrouter" in c[0].get("name", "").lower() and (c[1] == "openrouter/free" or c[1].endswith(":free")))
+                and "compound" not in c[1].lower()
+                and "qwen" not in c[1].lower()
+            ]
+        if emergency_candidates:
+            emergency_candidates.sort(key=lambda item: item[0].get("priority", 50), reverse=True)
+            plans.append({
+                "tier_name": f"长流程高可用保活兜底层 (Groq LPU / Nemotron 550B 极速接管)",
+                "candidates": emergency_candidates
+            })
     return plans
 
 # 1. 深度复刻 Linear.app 官方设计系统控制台（精简双模型版）
@@ -925,7 +990,7 @@ async def dashboard():
             /* 精简展示卡片 */
             .models-showcase {{
                 display: grid;
-                grid-template-columns: 1fr 1fr;
+                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
                 gap: 14px;
             }}
             .model-card {{
@@ -1262,10 +1327,10 @@ async def dashboard():
                 <div class="card-header">
                     <div class="card-title">
                         <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
-                        <span>Gateway Core Models · 网关保留的核心模型 (3 个)</span>
+                        <span>Gateway Core Flagships · 网关核心旗舰模型矩阵 (6 款)</span>
                     </div>
                     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-                        <span class="card-subtitle" style="margin:0;">DeepSeek-Harness 与客户端暴露模型</span>
+                        <span class="card-subtitle" style="margin:0;">全网前沿旗舰与客户端直调暴露模型</span>
                         <button class="btn btn-primary" id="btn-update-models-top" onclick="updateLatestModels()" style="padding:4px 12px;font-size:11.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px;" title="从全网与各渠道获取最新最强免费模型并写入配置">
                             <span class="svg-icon svg-icon-sm" id="update-models-icon-top"><svg viewBox="0 0 24 24"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg></span>
                             <span id="update-models-text-top">获取最新最强免费模型</span>
@@ -1275,38 +1340,56 @@ async def dashboard():
                 <div class="models-showcase">
                     <div class="model-card" style="border-color: rgba(94, 106, 210, 0.4); background: rgba(94, 106, 210, 0.04);">
                         <div class="model-card-top">
-                            <div class="model-card-id" style="color: #a5b4fc;">✨ auto (编程/推理默认)</div>
-                            <span class="badge badge-priority">顶级大厂 · 纯编程旗舰</span>
+                            <div class="model-card-id" style="color: #a5b4fc;">✨ auto (推理/编程天梯)</div>
+                            <span class="badge badge-priority">全渠道自适应容灾</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>纯代码/推理自适应天梯：</strong>优先调度 NVIDIA Kimi K3、DeepSeek V4、Nemotron 550B 及 Qwen 3.8，<strong>100% 隔离视觉模型</strong>，杜绝因视觉模型参数不兼容导致的长流程编程中断。
+                            <strong>纯代码/推理智能路由：</strong>聚合 DeepSeek V4、GLM-5.3、Kimi K3 及 Nemotron 3.5，<strong>100% 隔离视觉模型</strong>，保障长流程编码极速无中断。
                         </div>
                     </div>
                     <div class="model-card" style="border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.04);">
                         <div class="model-card-top">
                             <div class="model-card-id" style="color: #34d399;">⚡ deepseek-v4-flash</div>
-                            <span class="badge badge-success">同模型跨渠道轮询</span>
+                            <span class="badge badge-success">V4 极速推理旗舰</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>专属代码指定模型：</strong>严格锁定 DeepSeek 官方 V4-Flash 极速推理架构，仅在支持该模型的各渠道商间轮询（大厂优先）；若全部渠道均不可用则直接报错，绝不跨模型降级。
+                            <strong>DeepSeek 原生旗舰：</strong>独家优先接入 NVIDIA 满血 DeepSeek-V4-Flash 极速推理架构，毫秒级首字响应，支持多渠道同模型轮询。
+                        </div>
+                    </div>
+                    <div class="model-card" style="border-color: rgba(59, 130, 246, 0.4); background: rgba(59, 130, 246, 0.04);">
+                        <div class="model-card-top">
+                            <div class="model-card-id" style="color: #93c5fd;">🌟 glm-5.3 / glm-5.3-flash</div>
+                            <span class="badge" style="background:rgba(59, 130, 246, 0.15);color:#93c5fd;border:1px solid rgba(59, 130, 246, 0.3);">智谱 2026 旗舰</span>
+                        </div>
+                        <div class="model-card-desc">
+                            <strong>智谱新一代推理旗舰：</strong>超强双语深度逻辑思维链，200K 上下文窗口，代码综合生成与跨文件重构能力卓越。
+                        </div>
+                    </div>
+                    <div class="model-card" style="border-color: rgba(14, 165, 233, 0.4); background: rgba(14, 165, 233, 0.04);">
+                        <div class="model-card-top">
+                            <div class="model-card-id" style="color: #38bdf8;">🌙 kimi-k3</div>
+                            <span class="badge" style="background:rgba(14, 165, 233, 0.15);color:#38bdf8;border:1px solid rgba(14, 165, 233, 0.3);">月之暗面推理旗舰</span>
+                        </div>
+                        <div class="model-card-desc">
+                            <strong>256K 超长上下文推理：</strong>超强长程逻辑链推理，针对复杂多步规划、长文档深入分析与算法推导量身打造。
                         </div>
                     </div>
                     <div class="model-card" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.04);">
                         <div class="model-card-top">
                             <div class="model-card-id" style="color: #fbbf24;">👁️ vision (多模态视觉专属)</div>
-                            <span class="badge" style="background:rgba(245, 158, 11, 0.15);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.3);">视觉外挂 · 100万上下文</span>
+                            <span class="badge" style="background:rgba(245, 158, 11, 0.15);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.3);">Google 官方百万上下文</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>多模态视觉分析天梯：</strong>专供 Google Gemini 3.8 / 3.6 / 3.5 Flash 顶级视觉模型，用于 UI 还原、组件布局提取、报错截屏 OCR、设计稿审查，与编程 Agent 完美解耦。
+                            <strong>多模态视觉感知天梯：</strong>专供 Google Gemini 3.8 / 3.7 Flash 顶级视觉模型，UI 控件相对定位、报错截图 OCR、架构图深度理解。
                         </div>
                     </div>
                     <div class="model-card" style="border-color: rgba(168, 85, 247, 0.4); background: rgba(168, 85, 247, 0.04);">
                         <div class="model-card-top">
-                            <div class="model-card-id" style="color: #c084fc;">🎨 flux / image-gen (文生图专属)</div>
-                            <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">/v1/images/generations · 免Key</span>
+                            <div class="model-card-id" style="color: #c084fc;">🎨 image-gen (Imagen 3 零水印)</div>
+                            <span class="badge" style="background:rgba(168, 85, 247, 0.15);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.3);">100% 纯净零水印</span>
                         </div>
                         <div class="model-card-desc">
-                            <strong>AI 文生图引擎：</strong>兼容 OpenAI 标准图像生成协议，默认搭载 Flux / SDXL 免费高质量生图大模型，支持任意比例、本地落盘托管与多端渲染。
+                            <strong>Google Imagen 3 扩散生图引擎：</strong>电影级光影质感，全原生无水印渲染，支持任意宽高比与前端画廊实时落盘。
                         </div>
                     </div>
                 </div>
@@ -1568,8 +1651,20 @@ async def dashboard():
                 list.forEach((p) => {{
                     const pStat = stats.provider_stats[p.name] || {{ calls: 0, success: 0, errors: 0, last_latency_ms: 0 }};
                     const allModelIds = (p.models || []).map(m => m.id).join(", ");
-                    const modelsHtml = (p.models || []).slice(0, 5).map(m => `<span class="badge badge-model" title="${{m.id}}">${{m.id}}</span>`).join(" ");
-                    const moreBadge = (p.models && p.models.length > 5) ? `<span class="badge badge-model" style="color:var(--linear-brand);cursor:help;" title="${{allModelIds}}">+${{p.models.length - 5}}</span>` : "";
+                    const isFlagship = (id) => {{
+                        const low = (id || "").toLowerCase();
+                        return low.includes("deepseek-v4") || low.includes("glm-5.3") || low.includes("kimi-k3") ||
+                               low.includes("nemotron-3.5") || low.includes("gemini-3.8") || low.includes("inkling");
+                    }};
+                    const modelsHtml = (p.models || []).slice(0, 8).map(m => {{
+                        if (isFlagship(m.id)) {{
+                            return `<span class="badge badge-priority" style="cursor:pointer;font-size:10px;padding:2px 7px;background:rgba(94, 106, 210, 0.25);border:1px solid rgba(165, 180, 252, 0.4);color:#c7d2fe;" title="${{m.id}} (点击复制)" onclick="copyText('${{m.id}}')">★ ${{m.id}}</span>`;
+                        }}
+                        return `<span class="badge badge-model" style="cursor:pointer;" title="${{m.id}} (点击复制)" onclick="copyText('${{m.id}}')">${{m.id}}</span>`;
+                    }}).join(" ");
+                    const moreBadge = (p.models && p.models.length > 8) 
+                        ? `<span class="badge badge-model" style="color:var(--linear-brand);cursor:pointer;font-weight:600;background:rgba(94, 106, 210, 0.15);" onclick="openModelsModal('${{p.name}}')" title="点击展开全部 ${{p.models.length}} 款模型">+${{p.models.length - 8}} 款...</span>` 
+                        : "";
                     const categoryBadge = p.category ? `<span class="badge">${{p.category}}</span>` : "";
                     
                     const isBigTech = (p.priority || 0) >= 90;
@@ -1799,8 +1894,9 @@ async def dashboard():
                             providers = data.providers;
                             filterProviders();
                         }}
-                        const highlight = data.top_models ? data.top_models.slice(0, 4).map(m => `<b>${{m.name}}</b> (${{m.provider}})`).join("、") : "";
-                        showToast(`✅ <b>最新最强免费模型已写入配置！</b><br><span style="font-size:11px;color:var(--text-secondary);">已同步接入 ${{highlight}} 等前沿大模型</span>`, "success", 6000);
+                        const highlight = data.top_models ? data.top_models.slice(0, 5).map(m => `<b>${{m.name}}</b> (${{m.provider}})`).join("、") : "";
+                        const countText = data.added_count > 0 ? `发现并接入 <b>${{data.added_count}}</b> 款新模型，` : `已校验全网 <b>${{data.total_models || 140}}</b> 款免费模型，`;
+                        showToast(`✅ <b>最新最强免费模型矩阵已置顶并写入配置！</b><br><span style="font-size:11px;color:var(--text-secondary);">${{countText}}已置顶接入 ${{highlight}} 等前沿旗舰大模型</span>`, "success", 7000);
                     }} else {{
                         showToast(`更新模型失败: ${{data.message || "未知错误"}}`, "error", 4000);
                     }}
@@ -1947,10 +2043,82 @@ async def dashboard():
                 }}
             }}
 
+            let currentModalProvider = null;
+
+            function openModelsModal(provName) {{
+                currentModalProvider = providers.find(p => p.name === provName);
+                if (!currentModalProvider) return;
+                const modal = document.getElementById("models-modal");
+                document.getElementById("modal-title").innerText = `${{provName}} · 全部模型清单 (${{currentModalProvider.models ? currentModalProvider.models.length : 0}} 款)`;
+                document.getElementById("modal-search").value = "";
+                filterModalModels();
+                modal.style.display = "flex";
+            }}
+
+            function closeModelsModal() {{
+                const modal = document.getElementById("models-modal");
+                if (modal) modal.style.display = "none";
+                currentModalProvider = null;
+            }}
+
+            function filterModalModels() {{
+                if (!currentModalProvider) return;
+                const container = document.getElementById("modal-models-list");
+                const q = (document.getElementById("modal-search").value || "").toLowerCase().trim();
+                const list = (currentModalProvider.models || []).filter(m => !q || m.id.toLowerCase().includes(q) || (m.upstream_model && m.upstream_model.toLowerCase().includes(q)));
+                if (list.length === 0) {{
+                    container.innerHTML = `<div style="width:100%;text-align:center;color:var(--text-tertiary);padding:24px;">未找到匹配的模型</div>`;
+                    return;
+                }}
+                const isFlagship = (id) => {{
+                    const low = (id || "").toLowerCase();
+                    return low.includes("deepseek-v4") || low.includes("glm-5.3") || low.includes("kimi-k3") ||
+                           low.includes("nemotron-3.5") || low.includes("gemini-3.8") || low.includes("inkling");
+                }};
+                container.innerHTML = list.map(m => {{
+                    const flagship = isFlagship(m.id);
+                    const style = flagship 
+                        ? `background:rgba(94, 106, 210, 0.25);border:1px solid rgba(165, 180, 252, 0.4);color:#c7d2fe;`
+                        : ``;
+                    const prefix = flagship ? `★ ` : ``;
+                    return `<span class="badge badge-model" style="cursor:pointer;padding:4px 8px;font-size:11.5px;${{style}}" title="点击复制模型 ID" onclick="copyText('${{m.id}}')">${{prefix}}${{m.id}}</span>`;
+                }}).join("");
+            }}
+
+            function copyText(text) {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                    navigator.clipboard.writeText(text).then(() => {{
+                        showToast(`已复制模型名称: <b>${{text}}</b>`, "info", 2000);
+                    }}).catch(() => {{
+                        prompt("请复制模型名称:", text);
+                    }});
+                }} else {{
+                    prompt("请复制模型名称:", text);
+                }}
+            }}
+
             renderTable();
             loadLogs();
             setInterval(loadLogs, 2000);
         </script>
+
+        <!-- 📱 全部模型查看与检索弹窗 -->
+        <div id="models-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);z-index:9999;align-items:center;justify-content:center;padding:20px;" onclick="if(event.target===this)closeModelsModal()">
+            <div style="background:#16181d;border:1px solid rgba(255,255,255,0.15);border-radius:12px;width:100%;max-width:680px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 24px 48px rgba(0,0,0,0.6);overflow:hidden;" onclick="event.stopPropagation()">
+                <div style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:center;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span class="svg-icon" style="color:var(--linear-brand);"><svg viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></span>
+                        <h3 id="modal-title" style="margin:0;font-size:15px;color:var(--text-primary);">渠道模型全量清单</h3>
+                    </div>
+                    <button class="btn" onclick="closeModelsModal()" style="padding:4px 8px;font-size:14px;border:none;background:transparent;color:var(--text-secondary);cursor:pointer;">✕</button>
+                </div>
+                <div style="padding:12px 20px;border-bottom:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.2);">
+                    <input type="text" id="modal-search" class="key-input" placeholder="🔍 快速搜索模型 (例如 deepseek, glm, kimi, nemotron, llama)..." oninput="filterModalModels()" style="width:100%;font-size:13px;padding:8px 12px;">
+                </div>
+                <div id="modal-models-list" style="padding:16px 20px;overflow-y:auto;display:flex;flex-wrap:wrap;gap:8px;max-height:60vh;">
+                </div>
+            </div>
+        </div>
     </body>
     </html>
     """
@@ -2175,24 +2343,32 @@ async def fetch_and_update_latest_free_models() -> dict:
                 except Exception as e:
                     logger.warning(f"Failed to query NVIDIA NIM models: {e}")
 
-    # Curated Top Free Models Priorities (最强模型置顶排在最前)
+    KNOWN_DEAD_MODELS = {
+        "deepseek-ai/deepseek-v4-pro-0813",
+        "meta/llama-3.3-70b-instruct",
+        "moonshotai/kimi-k2.6",
+        "mistralai/codestral-22b-instruct-v0.1"
+    }
+
+    # Curated Top Free Models Priorities (最强最新模型置顶排在最前)
     curated_priorities = {
         "NVIDIA NIM": [
+            "deepseek-ai/deepseek-v4-flash-0731",
+            "z-ai/glm-5.3",
+            "z-ai/glm-5.3-flash",
             "moonshotai/kimi-k3",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
             "nvidia/nemotron-3-ultra-550b-a55b",
             "nvidia/nemotron-3-super-120b-a12b",
-            "nvidia/nemotron-3.5-lightning-30b-a3b",
             "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             "meta/llama-3.2-11b-vision-instruct",
-            "minimaxai/minimax-m3",
-            "google/diffusiongemma-26b-a4b-it",
-            "poolside/laguna-xs-2.1",
-            "openai/gpt-oss-20b",
-            "deepseek-ai/deepseek-v4-flash-0731",
-            "deepseek-ai/deepseek-v4-pro-0813",
+            "meta/llama-3.2-90b-vision-instruct",
+            "google/gemma-4-31b-it",
             "deepseek-ai/deepseek-coder-6.7b-instruct",
-            "mistralai/codestral-22b-instruct-v0.1",
-            "01-ai/yi-large"
+            "openai/gpt-oss-20b",
+            "minimaxai/minimax-m3",
+            "01-ai/yi-large",
+            "mistralai/mistral-large-2-instruct"
         ],
         "Google AI Studio": [
             "gemini-3.8-flash",
@@ -2201,6 +2377,7 @@ async def fetch_and_update_latest_free_models() -> dict:
             "gemini-flash-latest",
             "gemini-flash-lite-latest",
             "gemini-2.5-pro",
+            "gemini-2.5-flash",
             "gemma-4-31b-it",
             "gemma-4-26b-a4b-it"
         ],
@@ -2230,6 +2407,39 @@ async def fetch_and_update_latest_free_models() -> dict:
         ]
     }
 
+    # Ensure OpenRouter and Groq Cloud exist in providers list so discovered models can be surfaced
+    if "OpenRouter (Global)" not in prov_map:
+        openrouter_prov = {
+            "name": "OpenRouter (Global)",
+            "category": "全球聚合",
+            "enabled": True,
+            "weight": 10,
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "",
+            "models": discovered_models.get("OpenRouter (Global)", [
+                {"id": m, "upstream_model": m} for m in curated_priorities.get("OpenRouter (Global)", [])
+            ]),
+            "priority": 85
+        }
+        providers.append(openrouter_prov)
+        prov_map["OpenRouter (Global)"] = openrouter_prov
+
+    if "Groq Cloud" not in prov_map:
+        groq_prov = {
+            "name": "Groq Cloud",
+            "category": "极速芯片",
+            "enabled": False,
+            "weight": 10,
+            "base_url": "https://api.groq.com/openai/v1",
+            "api_key": "",
+            "models": [
+                {"id": m, "upstream_model": m} for m in curated_priorities.get("Groq Cloud", [])
+            ],
+            "priority": 90
+        }
+        providers.append(groq_prov)
+        prov_map["Groq Cloud"] = groq_prov
+
     added_count = 0
     updated_providers = []
 
@@ -2240,12 +2450,23 @@ async def fetch_and_update_latest_free_models() -> dict:
         existing_ids = {m.get("id") for m in existing_models}
         existing_upstreams = {m.get("upstream_model") for m in existing_models}
 
+        # Filter out known dead models
+        existing_models = [
+            m for m in existing_models
+            if m.get("id") not in KNOWN_DEAD_MODELS and m.get("upstream_model") not in KNOWN_DEAD_MODELS
+        ]
+
         candidates = []
         for cur_id in curated_priorities.get(p_name, []):
-            candidates.append({"id": cur_id, "upstream_model": cur_id})
+            if cur_id not in KNOWN_DEAD_MODELS:
+                candidates.append({"id": cur_id, "upstream_model": cur_id})
 
-        for disc_m in discovered_models.get(p_name, []):
-            candidates.append(disc_m)
+        disc_list = discovered_models.get(p_name, [])
+        valid_upstream_ids = {m.get("id") for m in disc_list}
+        for disc_m in disc_list:
+            did = disc_m.get("id")
+            if did and did not in KNOWN_DEAD_MODELS:
+                candidates.append(disc_m)
 
         new_top_models = []
         seen = set()
@@ -2253,6 +2474,9 @@ async def fetch_and_update_latest_free_models() -> dict:
             cid = cand.get("id")
             cup = cand.get("upstream_model") or cid
             if cid and cid not in seen:
+                # If we have verified active upstream list, filter out candidates not present
+                if valid_upstream_ids and cid not in valid_upstream_ids and cup not in valid_upstream_ids:
+                    continue
                 seen.add(cid)
                 if cid not in existing_ids and cup not in existing_upstreams:
                     added_count += 1
@@ -2260,7 +2484,10 @@ async def fetch_and_update_latest_free_models() -> dict:
 
         for old_m in existing_models:
             old_id = old_m.get("id")
+            old_up = old_m.get("upstream_model") or old_id
             if old_id and old_id not in seen:
+                if valid_upstream_ids and old_id not in valid_upstream_ids and old_up not in valid_upstream_ids:
+                    continue
                 seen.add(old_id)
                 new_top_models.append(old_m)
 
@@ -2271,36 +2498,37 @@ async def fetch_and_update_latest_free_models() -> dict:
     state.config["fallback_ladders"] = {
         "auto": [
             {
-                "tier": "Tier 1: 顶级大厂编程与推理旗舰层 (NVIDIA Kimi K3 / DeepSeek V4 / Groq Qwen 3.8 / GPT-OSS 120B / Nemotron 550B)",
+                "tier": "Tier 1: 顶级大厂编程与推理旗舰层 (DeepSeek V4 / GLM 5.3 / Kimi K3 / Nemotron 3.5 / Qwen 3.8 / GPT-OSS 120B)",
                 "models": [
-                    "moonshotai/kimi-k3",
                     "deepseek-ai/deepseek-v4-flash-0731",
-                    "qwen/qwen3.8-27b",
-                    "openai/gpt-oss-120b",
+                    "z-ai/glm-5.3",
+                    "z-ai/glm-5.3-flash",
+                    "moonshotai/kimi-k3",
+                    "nvidia/nemotron-3.5-lightning-30b-a3b",
                     "nvidia/nemotron-3-ultra-550b-a55b",
-                    "nvidia/nemotron-3-super-120b-a12b"
+                    "qwen/qwen3.8-27b",
+                    "openai/gpt-oss-120b"
                 ]
             },
             {
-                "tier": "Tier 2: LPU 极速芯片编程层 (Groq Qwen 3.8 / GPT-OSS 120B / Nemotron 3.5)",
+                "tier": "Tier 2: LPU 极速芯片与全尺寸开源旗舰层 (Nemotron 3.5 / Groq Qwen 3.8 / GPT-OSS 120B)",
                 "models": [
+                    "nvidia/nemotron-3.5-lightning-30b-a3b",
                     "openai/gpt-oss-120b",
                     "qwen/qwen3.8-27b",
                     "groq/compound-mini",
-                    "nvidia/nemotron-3.5-lightning-30b-a3b"
+                    "google/gemma-4-31b-it"
                 ]
             },
             {
-                "tier": "Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Cohere Code / Dots 512K)",
+                "tier": "Tier 3: 开源百万长上下文与深度思维链推理层 (Thinking Machines 1M / Dots 512K / Nemotron 1M)",
                 "models": [
-                    "moonshotai/kimi-k3",
-                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-                    "minimaxai/minimax-m3",
                     "thinkingmachines/inkling-small:free",
                     "thinkingmachines/inkling:free",
-                    "cohere/north-mini-code:free",
-                    "dots-studio/dots-3-note-preview:free",
                     "nvidia/nemotron-3.5-lightning:free",
+                    "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    "dots-studio/dots-3-note-preview:free",
+                    "minimaxai/minimax-m3",
                     "minimax/minimax-m3:free"
                 ]
             },
@@ -2313,42 +2541,88 @@ async def fetch_and_update_latest_free_models() -> dict:
         ],
         "vision": [
             {
-                "tier": "Tier 1: Google Gemini 顶级多模态视觉旗舰层 (Gemini 3.8 / 3.6 / 3.5 Flash · 100万上下文)",
+                "tier": "Tier 1: Google Gemini 顶级多模态视觉旗舰层 (Gemini 3.8 / 3.7 / 3.6 / 3.5 Flash · 100万上下文)",
                 "models": [
                     "gemini-3.8-flash",
+                    "gemini-3.7-flash",
                     "gemini-3.6-flash",
                     "gemini-3.5-flash",
                     "gemini-flash-latest"
                 ]
             },
             {
-                "tier": "Tier 2: 开源极速多模态视觉兜底层 (Llama 3.2 11B Vision)",
+                "tier": "Tier 2: 开源极速多模态视觉兜底层 (Llama 3.2 11B / 90B Vision)",
                 "models": [
-                    "meta/llama-3.2-11b-vision-instruct"
+                    "meta/llama-3.2-11b-vision-instruct",
+                    "meta/llama-3.2-90b-vision-instruct"
                 ]
             }
         ]
     }
-    state.config["exposed_models"] = ["auto", "deepseek-v4-flash", "vision"]
+    state.config["exposed_models"] = [
+        "auto",
+        "deepseek-v4-flash",
+        "glm-5.3",
+        "glm-5.3-flash",
+        "kimi-k3",
+        "nemotron-3.5",
+        "vision",
+        "image-gen"
+    ]
+
+    aliases = state.config.get("model_aliases", {})
+    aliases.update({
+        "auto": "auto",
+        "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
+        "deepseek-v4": "deepseek-ai/deepseek-v4-flash-0731",
+        "DeepSeek-V4-Flash": "deepseek-ai/deepseek-v4-flash-0731",
+        "deepseek": "deepseek-ai/deepseek-v4-flash-0731",
+        "glm-5.3": "z-ai/glm-5.3",
+        "glm-5.3-flash": "z-ai/glm-5.3-flash",
+        "glm": "z-ai/glm-5.3",
+        "glm5": "z-ai/glm-5.3",
+        "kimi-k3": "moonshotai/kimi-k3",
+        "kimi": "moonshotai/kimi-k3",
+        "kimi3": "moonshotai/kimi-k3",
+        "nemotron-3.5": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nemotron": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nemotron-ultra": "nvidia/nemotron-3-ultra-550b-a55b",
+        "gemini-3.8": "gemini-3.8-flash",
+        "gemini-3.8-flash": "gemini-3.8-flash",
+        "vision": "vision",
+        "vision-agent": "vision",
+        "codex": "deepseek-ai/deepseek-v4-flash-0731",
+        "image-gen": "image-gen",
+        "flux": "image-gen",
+        "gpt-5.3-codex": "auto",
+        "gpt-5.2-codex": "auto",
+        "gpt-5.1-codex": "auto",
+        "gpt-5-codex": "auto"
+    })
+    state.config["model_aliases"] = aliases
+    state.config["providers"] = providers
 
     save_config(state.config)
     state.reload_config()
 
     top_models_summary = [
-        {"name": "moonshotai/kimi-k3", "provider": "NVIDIA NIM", "context": "262,144", "tag": "Kimi K3 推理旗舰 · NVIDIA 独家满血首发"},
-        {"name": "gemini-3.8-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.8代旗舰 · 百万上下文"},
-        {"name": "gemini-3.5-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "3.5代生产主力"},
-        {"name": "openai/gpt-oss-120b", "provider": "Groq Cloud", "context": "131,072", "tag": "120B 开源旗舰 · 700+ t/s LPU"},
-        {"name": "qwen/qwen3.8-27b", "provider": "Groq Cloud", "context": "131,042", "tag": "通义千问3.8极速"},
-        {"name": "nvidia/nemotron-3-ultra-550b-a55b", "provider": "NVIDIA NIM", "context": "1,000,000", "tag": "550B MoE 巨无霸"},
-        {"name": "meta/llama-3.2-11b-vision-instruct", "provider": "NVIDIA NIM", "context": "131,072", "tag": "多模态视觉理解"},
-        {"name": "thinkingmachines/inkling-small:free", "provider": "OpenRouter", "context": "1,048,576", "tag": "100万长上下文 · 思维链"}
+        {"name": "deepseek-ai/deepseek-v4-flash-0731", "provider": "NVIDIA NIM", "context": "128,000", "tag": "🔥 2026 旗舰代码/推理 · 满血首选"},
+        {"name": "z-ai/glm-5.3", "provider": "NVIDIA NIM", "context": "200,000", "tag": "🌟 智谱 GLM 5.3 旗舰 · 深度思考"},
+        {"name": "z-ai/glm-5.3-flash", "provider": "NVIDIA NIM", "context": "200,000", "tag": "⚡ GLM 5.3 Flash · 极速推理"},
+        {"name": "moonshotai/kimi-k3", "provider": "NVIDIA NIM", "context": "262,144", "tag": "🌙 Kimi K3 推理旗舰 · 满血长上下文"},
+        {"name": "nvidia/nemotron-3.5-lightning-30b-a3b", "provider": "NVIDIA NIM", "context": "128,000", "tag": "⚡ Nemotron 3.5 闪电极速推理"},
+        {"name": "gemini-3.8-flash", "provider": "Google AI Studio", "context": "1,048,576", "tag": "👁️ Gemini 3.8 · 百万多模态旗舰"},
+        {"name": "meta/llama-3.2-11b-vision-instruct", "provider": "NVIDIA NIM", "context": "131,072", "tag": "👁️ Llama 3.2 视觉理解"},
+        {"name": "thinkingmachines/inkling-small:free", "provider": "OpenRouter", "context": "1,048,576", "tag": "🧠 100万长上下文 · 思维链"}
     ]
+
+    total_models = sum(len(p.get("models", [])) for p in providers)
 
     return {
         "status": "ok",
         "message": "成功检索并更新最新最强免费模型矩阵！",
         "added_count": added_count,
+        "total_models": total_models,
         "updated_providers": updated_providers,
         "top_models": top_models_summary,
         "providers": state.config.get("providers", [])
@@ -2407,6 +2681,34 @@ async def mock_unlimited_balance():
         }
     }
 
+def stream_peek_has_substance(peek_bytes: bytes) -> bool:
+    """精准嗅探 SSE 预读数据是否包含实质有效内容 (非空文本、推理过程、工具调用或完结标识)，排除纯空 assistant 块"""
+    try:
+        text = peek_bytes.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:") or line == "data: [DONE]":
+                continue
+            payload_str = line[5:].strip()
+            if not payload_str:
+                continue
+            payload = json.loads(payload_str)
+            for choice in payload.get("choices", []):
+                if choice.get("finish_reason"):
+                    return True
+                delta = choice.get("delta", {})
+                content = delta.get("content")
+                if content and content.strip():
+                    return True
+                rc = delta.get("reasoning_content")
+                if rc and rc.strip():
+                    return True
+                if delta.get("tool_calls"):
+                    return True
+    except Exception:
+        pass
+    return False
+
 # 4. 核心转发接口 (/v1/chat/completions)
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -2417,6 +2719,10 @@ async def chat_completions(request: Request):
     body = await request.json()
     requested_model = body.get("model", "auto")
     is_stream = body.get("stream", False)
+
+    ua = request.headers.get("user-agent", "").lower()
+    client_tag = "DeepSeek-Harness" if ("harness" in ua or "dsh" in ua or "node" in ua) else "Chat Client"
+    logger.info(f"👉 [{client_tag} / Chat Completions Request]: model={requested_model}, is_stream={is_stream}")
     
     messages = body.get("messages", [])
     prompt_snippet = ""
@@ -2443,13 +2749,13 @@ async def chat_completions(request: Request):
             if has_image:
                 break
 
-    # 若包含图像输入且请求模型为非原生视觉模型，自动无缝调度至顶级多模态视觉模型天梯
     effective_model = requested_model
     if has_image and not is_model_vision_capable(requested_model):
         logger.info(f"👁️ 【多模态视觉智能协同】检测到图像输入！[{requested_model}] 无原生视觉感知能力，已自动无缝切换至多模态视觉专属天梯 (Google Gemini 3.8 / 3.6 / 3.5 Flash)...")
         effective_model = "vision"
 
-    tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image)
+    has_tools = bool(forward_body.get("tools"))
+    tiered_plan = build_tiered_execution_plan(effective_model, has_image=has_image, has_tools=has_tools)
     if not tiered_plan:
         state.stats["failed_requests"] += 1
         return JSONResponse(
@@ -2510,13 +2816,20 @@ async def chat_completions(request: Request):
                 call_body.pop("metadata", None)
 
             if call_body.get("tools"):
-                # 注入强约束提示，确保无论 Nemotron 还是其它模型均携带 required 字段 (如 bash 的 description) 且主动发起工具调用
-                desc_hint = "CRITICAL: When calling any tool (such as bash), you MUST supply ALL required arguments, including 'description' (e.g. {\"command\": \"...\", \"description\": \"...\"}). Whenever you intend to inspect, edit, or test code, you MUST execute the corresponding tool immediately in your response rather than only describing your plan in text."
-                msgs = call_body.get("messages", [])
+                action_rule = (
+                    "CRITICAL AGENT RULE: You are an autonomous coding agent. "
+                    "Whenever your next step involves inspecting, creating, modifying, or testing files or directories, "
+                    "you MUST invoke the corresponding tool (e.g. exec_command) immediately in the very same response. "
+                    "NEVER output conversational messages saying what you will do (e.g. '开始批量创建...', '我会一次性写入...') "
+                    "without issuing the tool call in that same turn. Execute the tool call directly!"
+                )
+                msgs = list(call_body.get("messages", []))
                 if msgs and msgs[0].get("role") == "system":
-                    if "description" not in msgs[0].get("content", ""):
+                    if "CRITICAL AGENT RULE" not in msgs[0].get("content", ""):
                         msgs[0] = dict(msgs[0])
-                        msgs[0]["content"] = msgs[0]["content"] + f"\n\n{desc_hint}"
+                        msgs[0]["content"] = msgs[0]["content"] + f"\n\n{action_rule}"
+                elif msgs:
+                    msgs = [{"role": "system", "content": action_rule}] + msgs
                 call_body["messages"] = msgs
 
             # 2. Groq Cloud 协议适配
@@ -2556,22 +2869,22 @@ async def chat_completions(request: Request):
 
             try:
                 # 智能两阶段超时控制：
-                # 1. 阶段一（首包探针）：通过 asyncio.wait_for 设置短超时 (NVIDIA 12s, 其它 18s)，遇挂死立即 503 秒级故障转移
-                # 2. 阶段二（流式生成）：长 read 超时 (120s)，确保大模型 (Kimi K3 / Nemotron 550B / Gemini) 深度思考与长代码完整吐字不被掐断
-                p_read_timeout = 120.0 if is_stream else float(provider.get("timeout", 50.0))
-                client_timeout = httpx.Timeout(p_read_timeout, connect=8.0, read=p_read_timeout, write=30.0, pool=10.0)
+                # 1. 阶段一（首包探针）：握手与响应头设置 25s 快速探针，遇挂死立即冷却 30s 并秒级故障转移
+                # 2. 阶段二（流式生成）：分块流式读取设置 180s 宽裕超时，保障超大上下文与长思考/工具调用永不被误熔断
+                p_read_timeout = 180.0 if is_stream else float(provider.get("timeout", 90.0))
+                client_timeout = httpx.Timeout(p_read_timeout, connect=15.0, read=p_read_timeout, write=60.0, pool=10.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
-                    initial_header_timeout = 8.0 if "nvidia" in base_url.lower() else 12.0
+                    initial_header_timeout = 25.0
                     try:
                         response = await asyncio.wait_for(client.send(req, stream=True), timeout=initial_header_timeout)
                     except Exception as header_err:
                         await client.aclose()
                         model_key = f"{p_name}:{upstream_model}"
-                        state.model_cooldowns[model_key] = time.time() + 90.0
-                        logger.warning(f"⏱️ [{p_name} | {upstream_model}] 建立流式连接与等待响应头超时 ({header_err})，拉入 90s 冷却并秒级转移至下一候选...")
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        logger.warning(f"⏱️ [{p_name} | {upstream_model}] 建立流式连接与等待响应头超时 ({header_err})，开启 30s 冷却并秒级转移至下一候选...")
                         raise HTTPException(status_code=504, detail=f"[{p_name}] 等待响应头超时: {header_err}")
 
                     # 若遇到瞬时超载 (529/503) 或限流 (429)，开启 30s 冷却并秒级故障转移至下一候选
@@ -2595,26 +2908,38 @@ async def chat_completions(request: Request):
                         state.model_cooldowns[model_key] = time.time() + 30.0
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
-                    # 🌟 首包探针：预读取前 1-3 块数据，跳过 SSE 注释行（如 OpenRouter 的 ': OPENROUTER PROCESSING\n\n'）
-                    # 短超时检测上游是否挂死，拦截假 HTTP 200 实为 503/Overloaded 的 SSE 错误包
+                    # 🌟 首包深度探针：预读取流数据，必须嗅探到实质有效内容（非空文本、推理过程、工具调用或完结标识）
+                    # 彻底拦截假 200 实则卡死不吐字或仅返回空 assistant role 的假活流
                     stream_iter = response.aiter_bytes()
                     peek_chunks = []
+                    has_substance = False
                     try:
-                        peek_timeout = 12.0 if "nvidia" in base_url.lower() else 18.0
-                        while len(peek_chunks) < 3:
-                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=peek_timeout)
+                        peek_timeout = 15.0
+                        peek_deadline = time.time() + peek_timeout
+                        while time.time() < peek_deadline and len(peek_chunks) < 20:
+                            remaining = max(0.5, peek_deadline - time.time())
+                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=remaining)
                             peek_chunks.append(chunk)
-                            if not chunk.strip().startswith(b":"):
+                            if stream_peek_has_substance(b"".join(peek_chunks)):
+                                has_substance = True
                                 break
-                    except StopIteration:
+                    except (StopIteration, asyncio.TimeoutError):
                         pass
                     except Exception as peek_err:
                         await response.aclose()
                         await client.aclose()
                         model_key = f"{p_name}:{upstream_model}"
-                        state.model_cooldowns[model_key] = time.time() + 60.0
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接建立后首包读取超时/中断 ({peek_err})，开启 60s 冷却并秒级转移至下一候选...")
-                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后首包读取中断: {peek_err}")
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接建立后等待有效数据超时/挂死 ({peek_err})，开启 30s 冷却并秒级转移至下一候选...")
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立后等待有效数据超时: {peek_err}")
+
+                    if not has_substance:
+                        await response.aclose()
+                        await client.aclose()
+                        model_key = f"{p_name}:{upstream_model}"
+                        state.model_cooldowns[model_key] = time.time() + 30.0
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接已建立但在 15s 内未产出任何实质内容或推理，判定假活挂死，开启 30s 冷却并秒级转移至下一候选...")
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立但在 15s 内无任何实质有效内容")
 
                     # 检查已探测的块是否包含上游超载或报错 (如 OpenRouter / NVIDIA 在 200 SSE 流中推送 error 载荷)
                     combined_peek = b"".join(peek_chunks).lower()
@@ -3392,11 +3717,26 @@ async def handle_openai_responses(request: Request):
     else:
         is_stream = True  # Responses API 默认流式 SSE
 
-    logger.info(f"👉 [Responses API Request]: model={model}, is_stream={is_stream}, accept={accept_header}")
+    logger.info(f"👉 [Codex / Responses API Request]: model={model}, is_stream={is_stream}, accept={accept_header}")
+    logger.info(f"👉 [Codex Raw Tools]: {json.dumps(raw_tools, ensure_ascii=False)}")
 
     converted_messages = []
     if instructions and isinstance(instructions, str):
         converted_messages.append({"role": "system", "content": instructions})
+
+    if raw_tools:
+        action_rule = (
+            "CRITICAL AGENT RULE: You are an autonomous coding agent running inside Codex. "
+            "Whenever your next step involves inspecting, creating, modifying, or testing files or directories, "
+            "you MUST invoke the appropriate tool (such as exec_command or apply_patch) immediately in the very same response. "
+            "NEVER merely state your intention or say what you will do in text without issuing the tool call in that turn. "
+            "When using apply_patch, you must provide the complete patch string starting with '*** Begin Patch\\n' and ending with '\\n*** End Patch'. "
+            "You may also use exec_command to create or modify files using shell commands (e.g. cat << 'EOF' > file). Execute the tool call directly!"
+        )
+        if converted_messages and converted_messages[0].get("role") == "system":
+            converted_messages[0]["content"] += f"\n\n{action_rule}"
+        else:
+            converted_messages.insert(0, {"role": "system", "content": action_rule})
 
     if isinstance(raw_input, str):
         converted_messages.append({"role": "user", "content": raw_input})
@@ -3406,23 +3746,37 @@ async def handle_openai_responses(request: Request):
                 converted_messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
                 item_type = item.get("type")
-                if item_type == "function_call":
+                if item_type in ("function_call", "custom_tool_call"):
                     call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                     fn_name = item.get("name", "")
-                    args = item.get("arguments", "{}")
+                    args = item.get("arguments") or item.get("input") or "{}"
                     if isinstance(args, dict):
                         args = json.dumps(args)
-                    converted_messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
+                    elif isinstance(args, str):
+                        args_str = args.strip()
+                        if not (args_str.startswith("{") and args_str.endswith("}")):
+                            args = json.dumps({"patch": args} if fn_name == "apply_patch" else {"input": args})
+                    # 如果前一条消息也是 assistant，合并进同一次 assistant 调用的 tool_calls 列表（符合标准 OpenAI Chat 规范）
+                    if converted_messages and converted_messages[-1].get("role") == "assistant":
+                        if "tool_calls" not in converted_messages[-1]:
+                            converted_messages[-1]["tool_calls"] = []
+                        converted_messages[-1]["tool_calls"].append({
                             "id": call_id,
                             "type": "function",
                             "function": {"name": fn_name, "arguments": args}
-                        }]
-                    })
-                elif item_type == "function_call_output":
-                    call_id = item.get("call_id") or item.get("id") or ""
+                        })
+                    else:
+                        converted_messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": fn_name, "arguments": args}
+                            }]
+                        })
+                elif item_type in ("function_call_output", "custom_tool_call_output"):
+                    call_id = item.get("call_id") or item.get("id") or "call_default"
                     output = item.get("output", "")
                     if isinstance(output, (dict, list)):
                         output = json.dumps(output)
@@ -3455,15 +3809,42 @@ async def handle_openai_responses(request: Request):
             clean_m["content"] = m["content"]
         if role == "assistant" and "tool_calls" in m:
             clean_m["tool_calls"] = m["tool_calls"]
+            if clean_m.get("content") is None:
+                clean_m["content"] = ""
         if role == "tool" and "tool_call_id" in m:
-            clean_m["tool_call_id"] = m["tool_call_id"]
+            clean_m["tool_call_id"] = m["tool_call_id"] or "call_default"
         clean_messages.append(clean_m)
+    logger.info(f"👉 [Codex Converted Messages]: count={len(clean_messages)}, roles={[m.get('role') for m in clean_messages]}")
 
     converted_tools = []
     for t in raw_tools:
         if isinstance(t, dict):
             t_type = t.get("type")
-            if t_type == "function":
+            t_name = t.get("name") or (t.get("function", {}).get("name") if isinstance(t.get("function"), dict) else "")
+
+            # 针对 Codex 特有的 apply_patch 工具：为其注入标准 JSON Schema，杜绝大模型输出 {} 空参数
+            if t_name == "apply_patch":
+                converted_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "description": (
+                            "Use the apply_patch tool to edit files. Your patch language is a stripped-down, file-oriented diff format. "
+                            "You must provide the entire patch starting with '*** Begin Patch\\n' and ending with '\\n*** End Patch'."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "patch": {
+                                    "type": "string",
+                                    "description": "The complete patch content enclosed between '*** Begin Patch\\n' and '\\n*** End Patch'."
+                                }
+                            },
+                            "required": ["patch"]
+                        }
+                    }
+                })
+            elif t_type == "function":
                 if "function" in t:
                     converted_tools.append(t)
                 elif "name" in t:
@@ -3531,12 +3912,33 @@ async def handle_openai_responses(request: Request):
 
         for tc in tool_calls:
             fn = tc.get("function", {})
+            fn_name = fn.get("name", "")
+            fn_args = fn.get("arguments", "{}")
+            if fn_name == "apply_patch":
+                clean_patch = fn_args.strip()
+                if clean_patch.startswith("{") and clean_patch.endswith("}"):
+                    try:
+                        parsed_json = json.loads(clean_patch)
+                        for key in ["patch", "content", "diff", "input"]:
+                            if key in parsed_json and isinstance(parsed_json[key], str):
+                                clean_patch = parsed_json[key]
+                                break
+                    except Exception:
+                        pass
+                if "*** Begin Patch" in clean_patch:
+                    start_idx = clean_patch.find("*** Begin Patch")
+                    end_idx = clean_patch.find("*** End Patch")
+                    if end_idx != -1:
+                        clean_patch = clean_patch[start_idx : end_idx + len("*** End Patch")]
+                    else:
+                        clean_patch = clean_patch[start_idx:]
+                fn_args = clean_patch
             output_items.append({
                 "id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
                 "type": "function_call",
                 "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
-                "name": fn.get("name", ""),
-                "arguments": fn.get("arguments", "{}")
+                "name": fn_name,
+                "arguments": fn_args
             })
 
         responses_data = {
@@ -3579,135 +3981,215 @@ async def handle_openai_responses(request: Request):
         yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
 
         transport = httpx.ASGITransport(app=app)
-        internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0)
-        req = internal_client.build_request("POST", "/v1/chat/completions", json=chat_payload, headers=headers)
+        internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=240.0)
+
+        # 候选重试链：优先请求模型，若因上游挂起断流未产出任何有效内容，则通过同一 SSE 连接秒级无缝接力备用旗舰
+        candidate_models = [model]
+        for fb in ["z-ai/glm-5.3", "moonshotai/kimi-k3", "nvidia/nemotron-3.5-lightning-30b-a3b"]:
+            if fb not in candidate_models:
+                candidate_models.append(fb)
+
         upstream_res = None
         try:
-            send_task = asyncio.create_task(internal_client.send(req, stream=True))
-            while not send_task.done():
+            for try_idx, curr_model in enumerate(candidate_models):
+                curr_payload = dict(chat_payload)
+                curr_payload["model"] = curr_model
+                req = internal_client.build_request("POST", "/v1/chat/completions", json=curr_payload, headers=headers)
+                pending_leading_ws = ""
                 try:
-                    await asyncio.wait_for(asyncio.shield(send_task), timeout=1.2)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-            upstream_res = await send_task
-            if upstream_res.status_code != 200:
-                err_content = await upstream_res.aread()
-                err_str = err_content.decode("utf-8", errors="ignore")
-                logger.error(f"❌ [Responses API Streaming] 内部上游返回错误 HTTP {upstream_res.status_code}: {err_str}")
-                err_event = {
-                    "type": "response.failed",
-                    "response": {
-                        "id": resp_id,
-                        "object": "response",
-                        "status": "failed",
-                        "error": {
-                            "message": f"Upstream error HTTP {upstream_res.status_code}: {err_str[:200]}"
-                        }
+                    send_task = asyncio.create_task(internal_client.send(req, stream=True))
+                    while not send_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(send_task), timeout=1.2)
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                    upstream_res = await send_task
+                    if upstream_res.status_code != 200:
+                        err_content = await upstream_res.aread()
+                        err_str = err_content.decode("utf-8", errors="ignore")
+                        logger.warning(f"⚠️ [Responses API Streaming] 内部模型 [{curr_model}] 返回 HTTP {upstream_res.status_code}: {err_str[:200]}，尝试下一候选...")
+                        await upstream_res.aclose()
+                        upstream_res = None
+                        continue
+
+                    async for line in upstream_res.aiter_lines():
+                        line_str = line.strip()
+                        if not line_str or line_str.startswith(":"):
+                            continue
+                        if line_str == "data: [DONE]":
+                            break
+                        if not line_str.startswith("data: "):
+                            continue
+
+                        chunk_payload = line_str[6:].strip()
+                        try:
+                            chunk_obj = json.loads(chunk_payload)
+                        except Exception:
+                            continue
+
+                        if "model" in chunk_obj:
+                            final_model = chunk_obj["model"]
+
+                        choices = chunk_obj.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+
+                        # 文本增量推流
+                        text_chunk = delta.get("content")
+                        if text_chunk:
+                            if not msg_started:
+                                pending_leading_ws += text_chunk
+                                if not pending_leading_ws.strip():
+                                    continue
+                                msg_started = True
+                                item_added = {
+                                    "type": "response.output_item.added",
+                                    "output_index": output_index,
+                                    "item": {
+                                        "id": msg_id,
+                                        "type": "message",
+                                        "status": "in_progress",
+                                        "role": "assistant",
+                                        "content": []
+                                    }
+                                }
+                                yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
+                                part_added = {
+                                    "type": "response.content_part.added",
+                                    "output_index": output_index,
+                                    "content_index": 0,
+                                    "part": {"type": "output_text", "text": ""}
+                                }
+                                yield f"event: response.content_part.added\ndata: {json.dumps(part_added)}\n\n"
+                                text_chunk = pending_leading_ws
+                                pending_leading_ws = ""
+
+                            accumulated_text.append(text_chunk)
+                            delta_event = {
+                                "type": "response.output_text.delta",
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "delta": text_chunk
+                            }
+                            yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
+
+                        # 工具调用增量推流
+                        tool_deltas = delta.get("tool_calls")
+                        if tool_deltas and isinstance(tool_deltas, list):
+                            for td in tool_deltas:
+                                t_idx = td.get("index", 0)
+                                t_id = td.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                                fn = td.get("function", {})
+                                fn_name = fn.get("name", "")
+                                fn_args = fn.get("arguments", "")
+
+                                if t_idx not in tool_calls_map:
+                                    tool_out_idx = (1 if msg_started else 0) + t_idx
+                                    is_custom = (fn_name == "apply_patch")
+                                    tool_calls_map[t_idx] = {
+                                        "output_idx": tool_out_idx,
+                                        "id": t_id,
+                                        "name": fn_name,
+                                        "is_custom": is_custom,
+                                        "args": []
+                                    }
+                                    if is_custom:
+                                        item_added = {
+                                            "type": "response.output_item.added",
+                                            "output_index": tool_out_idx,
+                                            "item": {
+                                                "id": t_id,
+                                                "type": "custom_tool_call",
+                                                "call_id": t_id,
+                                                "name": fn_name,
+                                                "input": ""
+                                            }
+                                        }
+                                    else:
+                                        item_added = {
+                                            "type": "response.output_item.added",
+                                            "output_index": tool_out_idx,
+                                            "item": {
+                                                "id": t_id,
+                                                "type": "function_call",
+                                                "call_id": t_id,
+                                                "name": fn_name,
+                                                "arguments": ""
+                                            }
+                                        }
+                                    yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
+
+                                entry = tool_calls_map[t_idx]
+                                if fn_name and not entry["name"]:
+                                    entry["name"] = fn_name
+                                if fn_args:
+                                    entry["args"].append(fn_args)
+                                    # 针对 apply_patch：由于三方模型会输出 JSON 如 {"patch": "..."}，
+                                    # 而 Codex 官方 router 要求 arguments 为纯文本 plaintext 裸补丁格式，
+                                    # 不能将 JSON 符号 `{"patch": "` 逐字透传给 Codex，
+                                    # 否则 Codex router 接收到非 patch 字符会报 incompatible payload！
+                                    if entry["name"] != "apply_patch":
+                                        arg_event = {
+                                            "type": "response.function_call_arguments.delta",
+                                            "output_index": entry["output_idx"],
+                                            "call_id": entry["id"],
+                                            "delta": fn_args
+                                        }
+                                        yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_event)}\n\n"
+
+                    # 若当前模型已成功产出实质文本或工具调用，判定流式响应成功并结束候选重试
+                    valid_text = "".join(accumulated_text).strip()
+                    if valid_text or tool_calls_map:
+                        logger.info(f"✅ [Responses API Streaming] 模型 [{curr_model}] 成功产出实质响应 (文本: {len(valid_text)} 字符, 工具: {len(tool_calls_map)} 个)")
+                        break
+                    else:
+                        logger.warning(f"⚠️ [Responses API Streaming] 模型 [{curr_model}] 未产出任何实质内容或工具调用，秒级转移至下一模型...")
+                        msg_started = False
+                        accumulated_text = []
+                        tool_calls_map = {}
+                except Exception as loop_err:
+                    logger.warning(f"⚠️ [Responses API Streaming] 尝试模型 [{curr_model}] 异常: {repr(loop_err)}")
+                finally:
+                    if upstream_res:
+                        try:
+                            await upstream_res.aclose()
+                        except Exception:
+                            pass
+                        upstream_res = None
+
+            # 极端防中断保活：若所有候选均未产出有效内容，按照 OpenAI Responses API 完整规范依次发射 lifecycle 事件
+            if not msg_started and not tool_calls_map:
+                logger.warning("⚠️ [Responses API Streaming] 所有候选均未产出有效内容，执行完整生命周期保活注入防止 Agent 客户端中断")
+                rescue_text = "I have completed processing the current turn. Please proceed."
+                msg_started = True
+                accumulated_text.append(rescue_text)
+                item_added = {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": []
                     }
                 }
-                yield f"event: response.failed\ndata: {json.dumps(err_event)}\n\n"
-                return
-
-            async for line in upstream_res.aiter_lines():
-                line_str = line.strip()
-                if not line_str or line_str.startswith(":"):
-                    continue
-                if line_str == "data: [DONE]":
-                    break
-                if not line_str.startswith("data: "):
-                    continue
-
-                chunk_payload = line_str[6:].strip()
-                try:
-                    chunk_obj = json.loads(chunk_payload)
-                except Exception:
-                    continue
-
-                if "model" in chunk_obj:
-                    final_model = chunk_obj["model"]
-
-                choices = chunk_obj.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-
-                # 文本增量推流
-                text_chunk = delta.get("content")
-                if text_chunk:
-                    if not msg_started:
-                        msg_started = True
-                        item_added = {
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "item": {
-                                "id": msg_id,
-                                "type": "message",
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": []
-                            }
-                        }
-                        yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
-                        part_added = {
-                            "type": "response.content_part.added",
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": ""}
-                        }
-                        yield f"event: response.content_part.added\ndata: {json.dumps(part_added)}\n\n"
-
-                    accumulated_text.append(text_chunk)
-                    delta_event = {
-                        "type": "response.output_text.delta",
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "delta": text_chunk
-                    }
-                    yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
-
-                # 工具调用增量推流
-                tool_deltas = delta.get("tool_calls")
-                if tool_deltas and isinstance(tool_deltas, list):
-                    for td in tool_deltas:
-                        t_idx = td.get("index", 0)
-                        t_id = td.get("id") or f"call_{uuid.uuid4().hex[:8]}"
-                        fn = td.get("function", {})
-                        fn_name = fn.get("name", "")
-                        fn_args = fn.get("arguments", "")
-
-                        if t_idx not in tool_calls_map:
-                            tool_out_idx = (1 if msg_started else 0) + t_idx
-                            tool_calls_map[t_idx] = {
-                                "output_idx": tool_out_idx,
-                                "id": t_id,
-                                "name": fn_name,
-                                "args": []
-                            }
-                            item_added = {
-                                "type": "response.output_item.added",
-                                "output_index": tool_out_idx,
-                                "item": {
-                                    "id": t_id,
-                                    "type": "function_call",
-                                    "call_id": t_id,
-                                    "name": fn_name,
-                                    "arguments": ""
-                                }
-                            }
-                            yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
-
-                        entry = tool_calls_map[t_idx]
-                        if fn_name and not entry["name"]:
-                            entry["name"] = fn_name
-                        if fn_args:
-                            entry["args"].append(fn_args)
-                            arg_event = {
-                                "type": "response.function_call_arguments.delta",
-                                "output_index": entry["output_idx"],
-                                "call_id": entry["id"],
-                                "delta": fn_args
-                            }
-                            yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_event)}\n\n"
+                yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
+                part_added = {
+                    "type": "response.content_part.added",
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""}
+                }
+                yield f"event: response.content_part.added\ndata: {json.dumps(part_added)}\n\n"
+                delta_event = {
+                    "type": "response.output_text.delta",
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": rescue_text
+                }
+                yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
 
             # 文本结束事件
             if msg_started:
@@ -3742,44 +4224,74 @@ async def handle_openai_responses(request: Request):
             # 工具调用结束事件
             for t_idx, entry in tool_calls_map.items():
                 full_args = "".join(entry["args"])
-                arg_done = {
-                    "type": "response.function_call_arguments.done",
-                    "output_index": entry["output_idx"],
-                    "call_id": entry["id"],
-                    "arguments": full_args
-                }
-                yield f"event: response.function_call_arguments.done\ndata: {json.dumps(arg_done)}\n\n"
-                item_done = {
-                    "type": "response.output_item.done",
-                    "output_index": entry["output_idx"],
-                    "item": {
-                        "id": entry["id"],
-                        "type": "function_call",
+                if entry.get("is_custom") or entry["name"] == "apply_patch":
+                    # 智能解包 apply_patch 参数：
+                    # 若模型输出了 JSON 格式 {"patch": "...", ...} 或 {"content": "..."}，
+                    # 提取其中的 patch 纯文本，转换为 Codex 原生期望的 custom_tool_call (input: 纯文本裸补丁)
+                    clean_patch = extract_clean_patch(full_args)
+                    entry["final_args"] = clean_patch
+                    item_done = {
+                        "type": "response.output_item.done",
+                        "output_index": entry["output_idx"],
+                        "item": {
+                            "id": entry["id"],
+                            "type": "custom_tool_call",
+                            "call_id": entry["id"],
+                            "name": entry["name"],
+                            "input": clean_patch
+                        }
+                    }
+                    yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
+                else:
+                    entry["final_args"] = full_args
+                    arg_done = {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": entry["output_idx"],
                         "call_id": entry["id"],
-                        "name": entry["name"],
                         "arguments": full_args
                     }
-                }
-                yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
+                    yield f"event: response.function_call_arguments.done\ndata: {json.dumps(arg_done)}\n\n"
+                    item_done = {
+                        "type": "response.output_item.done",
+                        "output_index": entry["output_idx"],
+                        "item": {
+                            "id": entry["id"],
+                            "type": "function_call",
+                            "call_id": entry["id"],
+                            "name": entry["name"],
+                            "arguments": full_args
+                        }
+                    }
+                    yield f"event: response.output_item.done\ndata: {json.dumps(item_done)}\n\n"
 
             # response.completed 终结事件 (规范不带 data: [DONE])
             final_outputs = []
-            if msg_started:
+            full_text = "".join(accumulated_text)
+            if msg_started and full_text.strip():
                 final_outputs.append({
                     "id": msg_id,
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "".join(accumulated_text)}]
+                    "content": [{"type": "output_text", "text": full_text}]
                 })
             for t_idx, entry in tool_calls_map.items():
-                final_outputs.append({
-                    "id": entry["id"],
-                    "type": "function_call",
-                    "call_id": entry["id"],
-                    "name": entry["name"],
-                    "arguments": "".join(entry["args"])
-                })
+                if entry.get("is_custom") or entry["name"] == "apply_patch":
+                    final_outputs.append({
+                        "id": entry["id"],
+                        "type": "custom_tool_call",
+                        "call_id": entry["id"],
+                        "name": entry["name"],
+                        "input": entry.get("final_args", extract_clean_patch("".join(entry["args"])))
+                    })
+                else:
+                    final_outputs.append({
+                        "id": entry["id"],
+                        "type": "function_call",
+                        "call_id": entry["id"],
+                        "name": entry["name"],
+                        "arguments": entry.get("final_args", "".join(entry["args"]))
+                    })
 
             total_comp_tokens = max(1, len("".join(accumulated_text)) // 4)
             completed_event = {
