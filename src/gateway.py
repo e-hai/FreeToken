@@ -1783,7 +1783,7 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                     peek_chunks = []
                     has_substance = False
                     try:
-                        peek_timeout = 15.0
+                        peek_timeout = float(provider.get("peek_timeout", 35.0))
                         peek_deadline = time.time() + peek_timeout
                         while time.time() < peek_deadline and len(peek_chunks) < 20:
                             remaining = max(0.5, peek_deadline - time.time())
@@ -1807,8 +1807,8 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         await client.aclose()
                         model_key = f"{p_name}:{upstream_model}"
                         state.model_cooldowns[model_key] = time.time() + 30.0
-                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接已建立但在 15s 内未产出任何实质内容或推理，判定假活挂死，开启 30s 冷却并秒级转移至下一候选...")
-                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立但在 15s 内无任何实质有效内容")
+                        logger.warning(f"⚠️ [{p_name} | {upstream_model}] 连接已建立但在 {peek_timeout}s 内未产出任何实质内容或推理，判定假活挂死，开启 30s 冷却并秒级转移至下一候选...")
+                        raise HTTPException(status_code=503, detail=f"[{p_name}] 连接建立但在 {peek_timeout}s 内无任何实质有效内容")
 
                     # 检查已探测的块是否包含上游超载或报错 (如 OpenRouter / NVIDIA 在 200 SSE 流中推送 error 载荷)
                     combined_peek = b"".join(peek_chunks).lower()
@@ -2577,6 +2577,27 @@ async def handle_anthropic_messages(request: Request):
         "stop_reason": "end_turn"
     })
 
+def extract_clean_patch(raw_args: str) -> str:
+    """从原始模型参数中精准提取或还原 Codex 原生期望的 plaintext 裸补丁格式"""
+    clean_patch = (raw_args or "").strip()
+    if clean_patch.startswith("{") and clean_patch.endswith("}"):
+        try:
+            parsed_json = json.loads(clean_patch)
+            for key in ["patch", "content", "diff", "input"]:
+                if key in parsed_json and isinstance(parsed_json[key], str):
+                    clean_patch = parsed_json[key]
+                    break
+        except Exception:
+            pass
+    if "*** Begin Patch" in clean_patch:
+        start_idx = clean_patch.find("*** Begin Patch")
+        end_idx = clean_patch.find("*** End Patch")
+        if end_idx != -1:
+            clean_patch = clean_patch[start_idx : end_idx + len("*** End Patch")]
+        else:
+            clean_patch = clean_patch[start_idx:]
+    return clean_patch
+
 # ==============================================================================
 # 🤖 OpenAI Responses API 协议适配器 (/v1/responses)
 # 专为 ChatGPT Codex CLI 及新一代 Agentic 工具设计，支持 instructions/input/tools
@@ -2809,31 +2830,22 @@ async def handle_openai_responses(request: Request):
             else:
                 state.stats["codex"]["tool_calls"]["other"] += 1
             if fn_name == "apply_patch":
-                clean_patch = fn_args.strip()
-                if clean_patch.startswith("{") and clean_patch.endswith("}"):
-                    try:
-                        parsed_json = json.loads(clean_patch)
-                        for key in ["patch", "content", "diff", "input"]:
-                            if key in parsed_json and isinstance(parsed_json[key], str):
-                                clean_patch = parsed_json[key]
-                                break
-                    except Exception:
-                        pass
-                if "*** Begin Patch" in clean_patch:
-                    start_idx = clean_patch.find("*** Begin Patch")
-                    end_idx = clean_patch.find("*** End Patch")
-                    if end_idx != -1:
-                        clean_patch = clean_patch[start_idx : end_idx + len("*** End Patch")]
-                    else:
-                        clean_patch = clean_patch[start_idx:]
-                fn_args = clean_patch
-            output_items.append({
-                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function_call",
-                "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
-                "name": fn_name,
-                "arguments": fn_args
-            })
+                clean_patch = extract_clean_patch(fn_args)
+                output_items.append({
+                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "custom_tool_call",
+                    "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "name": fn_name,
+                    "input": clean_patch
+                })
+            else:
+                output_items.append({
+                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function_call",
+                    "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "name": fn_name,
+                    "arguments": fn_args
+                })
 
         responses_data = {
             "id": resp_id,
@@ -3122,7 +3134,11 @@ async def handle_openai_responses(request: Request):
                     # 智能解包 apply_patch 参数：
                     # 若模型输出了 JSON 格式 {"patch": "...", ...} 或 {"content": "..."}，
                     # 提取其中的 patch 纯文本，转换为 Codex 原生期望的 custom_tool_call (input: 纯文本裸补丁)
-                    clean_patch = extract_clean_patch(full_args)
+                    try:
+                        clean_patch = extract_clean_patch(full_args)
+                    except Exception as ex:
+                        logger.warning(f"⚠️ [Codex] extract_clean_patch error: {ex}")
+                        clean_patch = full_args
                     entry["final_args"] = clean_patch
                     item_done = {
                         "type": "response.output_item.done",
