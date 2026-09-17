@@ -1550,6 +1550,36 @@ async def mock_unlimited_balance():
         }
     }
 
+# 流式空闲哨兵：aiter_with_idle 在上游静默时产出该对象，用于注入 SSE 保活
+STREAM_IDLE = object()
+
+async def aiter_with_idle(aiter_obj, idle_timeout: float = 5.0):
+    """逐块转发上游异步迭代器，上游静默超过 idle_timeout 时产出 STREAM_IDLE 哨兵。
+
+    严禁用 asyncio.wait_for 包裹 __anext__()：超时会取消该协程，把 CancelledError
+    抛进上游异步生成器并令其就地关闭，之后再调用 __anext__() 只会得到
+    StopAsyncIteration，表现为响应在中途被静默截断且被误判为正常完结。
+    这里始终复用同一个 pending task，超时只是返回控制权，绝不取消上游读取。
+    """
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(aiter_obj.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=idle_timeout)
+            if not done:
+                yield STREAM_IDLE
+                continue
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            yield chunk
+    finally:
+        if pending is not None:
+            pending.cancel()
+
 def stream_peek_has_substance(peek_bytes: bytes) -> bool:
     """精准嗅探 SSE 预读数据是否包含实质有效内容 (非空文本、推理过程、工具调用或完结标识)，排除纯空 assistant 块"""
     try:
@@ -1814,7 +1844,7 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                             if stream_peek_has_substance(b"".join(peek_chunks)):
                                 has_substance = True
                                 break
-                    except (StopIteration, asyncio.TimeoutError):
+                    except (StopIteration, StopAsyncIteration, asyncio.TimeoutError):
                         pass
                     except Exception as peek_err:
                         await response.aclose()
@@ -1953,14 +1983,15 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         try:
                             iter_obj = combined_bytes_iter()
                             if not has_tools:
-                                while True:
-                                    try:
-                                        chunk = await asyncio.wait_for(iter_obj.__anext__(), timeout=5.0)
-                                        yield chunk
-                                    except asyncio.TimeoutError:
-                                        yield b": keepalive\n\n"
-                                    except StopAsyncIteration:
-                                        break
+                                idle_iter = aiter_with_idle(iter_obj, 5.0)
+                                try:
+                                    async for chunk in idle_iter:
+                                        if chunk is STREAM_IDLE:
+                                            yield b": keepalive\n\n"
+                                        else:
+                                            yield chunk
+                                finally:
+                                    await idle_iter.aclose()
                             else:
                                 buffer = ""
 
@@ -2107,22 +2138,22 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                                     else:
                                         yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
 
-                                while True:
-                                    try:
-                                        chunk_bytes = await asyncio.wait_for(iter_obj.__anext__(), timeout=5.0)
-                                    except asyncio.TimeoutError:
-                                        yield b": keepalive\n\n"
-                                        continue
-                                    except StopAsyncIteration:
-                                        break
+                                idle_iter = aiter_with_idle(iter_obj, 5.0)
+                                try:
+                                    async for chunk_bytes in idle_iter:
+                                        if chunk_bytes is STREAM_IDLE:
+                                            yield b": keepalive\n\n"
+                                            continue
 
-                                    buffer += chunk_bytes.decode("utf-8", errors="replace")
-                                    while "\n\n" in buffer:
-                                        msg_raw, buffer = buffer.split("\n\n", 1)
-                                        msg_raw = msg_raw.strip()
-                                        if msg_raw:
-                                            async for out in process_sse_msg(msg_raw):
-                                                yield out
+                                        buffer += chunk_bytes.decode("utf-8", errors="replace")
+                                        while "\n\n" in buffer:
+                                            msg_raw, buffer = buffer.split("\n\n", 1)
+                                            msg_raw = msg_raw.strip()
+                                            if msg_raw:
+                                                async for out in process_sse_msg(msg_raw):
+                                                    yield out
+                                finally:
+                                    await idle_iter.aclose()
 
                                 if buffer.strip():
                                     async for out in process_sse_msg(buffer.strip()):
@@ -2976,6 +3007,7 @@ async def handle_openai_responses(request: Request):
         resp_id = f"resp_{uuid.uuid4().hex[:16]}"
         created_at = int(time.time())
         output_index = 0
+        next_output_index = 0
         msg_started = False
         msg_id = f"msg_{uuid.uuid4().hex[:16]}"
         accumulated_text = []
@@ -3005,6 +3037,8 @@ async def handle_openai_responses(request: Request):
                 candidate_models.append(fb)
 
         upstream_res = None
+        line_iter = None
+        upstream_provider = "Upstream"
         stream_interrupted = False
         stream_err_msg = ""
         try:
@@ -3013,6 +3047,8 @@ async def handle_openai_responses(request: Request):
                 curr_payload["model"] = curr_model
                 req = internal_client.build_request("POST", "/v1/chat/completions", json=curr_payload, headers=headers)
                 pending_leading_ws = ""
+                stream_interrupted = False
+                stream_err_msg = ""
                 try:
                     send_task = asyncio.create_task(internal_client.send(req, stream=True))
                     while not send_task.done():
@@ -3029,15 +3065,34 @@ async def handle_openai_responses(request: Request):
                         upstream_res = None
                         continue
 
-                    line_iter = upstream_res.aiter_lines()
+                    upstream_provider = upstream_res.headers.get("X-Gateway-Provider", upstream_provider)
+                    line_iter = aiter_with_idle(upstream_res.aiter_lines(), 5.0)
+                    idle_ticks = 0
                     while True:
                         try:
-                            line = await asyncio.wait_for(line_iter.__anext__(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            yield ": keepalive\n\n"
-                            continue
+                            line = await line_iter.__anext__()
                         except StopAsyncIteration:
                             break
+
+                        if line is STREAM_IDLE:
+                            idle_ticks += 1
+                            # SSE 注释只能保活中间代理，无法重置 Codex 客户端自身的流空闲计时，
+                            # 因此每约 20s 再补发一个真实的 response.in_progress 生命周期事件
+                            yield ": keepalive\n\n"
+                            if idle_ticks % 4 == 0:
+                                in_progress_event = {
+                                    "type": "response.in_progress",
+                                    "response": {
+                                        "id": resp_id,
+                                        "object": "response",
+                                        "status": "in_progress",
+                                        "model": final_model,
+                                        "created_at": created_at
+                                    }
+                                }
+                                yield f"event: response.in_progress\ndata: {json.dumps(in_progress_event)}\n\n"
+                            continue
+                        idle_ticks = 0
 
                         line_str = line.strip()
                         if not line_str or line_str.startswith(":"):
@@ -3071,6 +3126,8 @@ async def handle_openai_responses(request: Request):
                                 if not pending_leading_ws.strip():
                                     continue
                                 msg_started = True
+                                output_index = next_output_index
+                                next_output_index += 1
                                 item_added = {
                                     "type": "response.output_item.added",
                                     "output_index": output_index,
@@ -3113,7 +3170,8 @@ async def handle_openai_responses(request: Request):
                                 fn_args = fn.get("arguments", "")
 
                                 if t_idx not in tool_calls_map:
-                                    tool_out_idx = (1 if msg_started else 0) + t_idx
+                                    tool_out_idx = next_output_index
+                                    next_output_index += 1
                                     is_custom = (fn_name == "apply_patch")
                                     tool_calls_map[t_idx] = {
                                         "output_idx": tool_out_idx,
@@ -3176,11 +3234,27 @@ async def handle_openai_responses(request: Request):
                         msg_started = False
                         accumulated_text = []
                         tool_calls_map = {}
+                        next_output_index = 0
                 except Exception as loop_err:
                     logger.warning(f"⚠️ [Responses API Streaming] 尝试模型 [{curr_model}] 异常: {repr(loop_err)}")
                     stream_interrupted = True
                     stream_err_msg = str(loop_err)
+                    if msg_started or tool_calls_map:
+                        # 已向客户端推送过部分事件，换模型重来会产生重复 / 错乱的 output_index，
+                        # 只能如实上报 response.failed 让 Codex 客户端自行重试整轮
+                        break
+                    # 尚未推送任何事件，清空状态后继续下一个候选
+                    msg_started = False
+                    accumulated_text = []
+                    tool_calls_map = {}
+                    next_output_index = 0
                 finally:
+                    if line_iter is not None:
+                        try:
+                            await line_iter.aclose()
+                        except Exception:
+                            pass
+                        line_iter = None
                     if upstream_res:
                         try:
                             await upstream_res.aclose()
@@ -3209,38 +3283,28 @@ async def handle_openai_responses(request: Request):
                 yield f"event: response.failed\ndata: {json.dumps(failed_event)}\n\n"
                 return
 
-            # 极端防中断保活：若所有候选均未产出有效内容，按照 OpenAI Responses API 完整规范依次发射 lifecycle 事件
+            # 所有候选均未产出任何内容：必须如实发射 response.failed，让 Codex 自行重试本轮。
+            # 绝不能补发一条伪造的 assistant 文本 —— Codex 会把“有文本、无工具调用”判定为本轮
+            # 正常收尾，从而直接静默终止整个任务（表现为“执行一段就停止”）。
             if not msg_started and not tool_calls_map:
-                logger.warning("⚠️ [Responses API Streaming] 所有候选均未产出有效内容，执行完整生命周期保活注入防止 Agent 客户端中断")
-                rescue_text = "I have completed processing the current turn. Please proceed."
-                msg_started = True
-                accumulated_text.append(rescue_text)
-                item_added = {
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": []
+                logger.error("❌ [Responses API Streaming] 所有候选模型均未产出任何内容，发射 response.failed 让客户端重试本轮")
+                empty_failed_event = {
+                    "type": "response.failed",
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "failed",
+                        "model": final_model,
+                        "created_at": created_at,
+                        "error": {
+                            "type": "server_error",
+                            "code": "empty_upstream_response",
+                            "message": "All upstream candidates returned an empty stream, please retry."
+                        }
                     }
                 }
-                yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n"
-                part_added = {
-                    "type": "response.content_part.added",
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": ""}
-                }
-                yield f"event: response.content_part.added\ndata: {json.dumps(part_added)}\n\n"
-                delta_event = {
-                    "type": "response.output_text.delta",
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "delta": rescue_text
-                }
-                yield f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n"
+                yield f"event: response.failed\ndata: {json.dumps(empty_failed_event)}\n\n"
+                return
 
             # 文本结束事件
             if msg_started:
@@ -3358,7 +3422,7 @@ async def handle_openai_responses(request: Request):
 
             total_comp_tokens = max(1, len("".join(accumulated_text)) // 4)
             state.stats["codex"]["tokens"] += 15 + total_comp_tokens
-            final_provider = upstream_res.headers.get("X-Gateway-Provider") if upstream_res else "Upstream"
+            final_provider = upstream_provider
             logger.info(f"✨ [Responses API Streaming] 成功完成流式响应！客户端模型: [{model}] -> 命中渠道商 [{final_provider}] 的具体大模型 [{final_model}] (输出文本: {len(''.join(accumulated_text))} 字符, 工具调用: {len(tool_calls_map)} 个)")
             completed_event = {
                 "type": "response.completed",
