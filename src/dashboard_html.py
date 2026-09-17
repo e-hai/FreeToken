@@ -1146,7 +1146,7 @@ def get_dashboard_html(harness_providers_json: str, codex_providers_json: str, h
             const cdHtml = cds.length
                 ? `<div style="margin-bottom:10px;font-size:11px;color:var(--accent-amber);">冷却: ${{cds.map(c => escapeHtml(c.provider) + '/' + escapeHtml(c.model) + ' ' + c.remaining_s + 's').join(' · ')}}</div>`
                 : '';
-            const boxes = ['auto', 'deepseek', 'glm', 'kimi'].map(group => {{
+            const boxes = ['auto', 'deepseek', 'deepseek-v4-pro', 'glm', 'kimi'].map(group => {{
                 const items = queues[group] || [];
                 const rows = items.length
                     ? items.map((it, idx) => `<div class="queue-item">${{idx + 1}}. ${{escapeHtml(it.provider)}} / ${{escapeHtml(it.model)}}${{it.cooldown_s ? ` <span class="cooldown">${{it.cooldown_s}}s</span>` : ''}}</div>`).join('')

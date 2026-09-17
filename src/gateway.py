@@ -257,7 +257,7 @@ def build_dispatch_snapshot(channel: str) -> dict:
     cooldowns.sort(key=lambda x: x["remaining_s"], reverse=True)
 
     queues = {}
-    for group in ("auto", "deepseek", "glm", "kimi"):
+    for group in ("auto", "deepseek", "deepseek-v4-pro", "glm", "kimi"):
         plan = build_tiered_execution_plan(group, has_tools=True, channel=channel)
         items = []
         for tier in plan:
@@ -846,6 +846,14 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
             "deepseek-v4-flash",
             "deepseek-v4",
         ],
+        # 点名 V4 Pro：只收 pro 型号，失败后由 family_fallback_order 退回 deepseek 组。
+        "deepseek-v4-pro": [
+            "deepseek/deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-v4-pro-0813",
+            "deepseek-v4-pro-0813",
+            "deepseek/deepseek-v4-pro",
+            "deepseek-v4-pro",
+        ],
         "glm": [
             "z-ai/glm-5.3",
             "z-ai/glm-5.3-flash",
@@ -866,7 +874,9 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
     }
     if selected_group:
         target_keys.update(model_group_preferences[selected_group])
-    if "deepseek" in req_clean:
+    # 组入口自带完整型号清单。再叠加下面这份泛化的 deepseek 展开，会把 flash 也算作精确命中，
+    # 于是高优先级渠道的 flash 反而挤掉被点名的 pro，故仅对非组入口生效。
+    if not selected_group and "deepseek" in req_clean:
         target_keys.update([
             "deepseek/deepseek-v4-pro-0813",
             "deepseek-ai/deepseek-v4-pro-0813",
@@ -926,6 +936,7 @@ def build_tiered_execution_plan(requested_model: str, has_image: bool = False, h
         # 非视觉任务：先耗尽所选家族，再按家族容灾顺序追加其它旗舰模型。
         family_fallback_order = {
             "deepseek": ["glm", "kimi"],
+            "deepseek-v4-pro": ["deepseek", "glm", "kimi"],
             "glm": ["deepseek", "kimi"],
             "kimi": ["deepseek", "glm"],
         }
@@ -1160,6 +1171,8 @@ async def api_validate_config(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"YAML 校验失败: {str(e)}")
     return {"status": "ok", "summary": summary}
+
+@app_harness.get("/api/logs")
 async def api_get_logs(channel: str = "all"):
     if channel == "all":
         return state.request_logs
@@ -1287,6 +1300,68 @@ async def api_save_codex_config(request: Request):
     logger.info("config.codex.yaml updated and hot-reloaded.")
     return {"status": "ok", "message": "Codex CLI 配置已成功保存并即时热重载！"}
 
+CODEX_MODEL_LABELS = {
+    "auto": ("Auto 智能自适应天梯", "自适应容灾天梯：deepseek-ai -> z-ai -> moonshotai -> nvidia"),
+    "deepseek": ("DeepSeek 家族优先", "优先 DeepSeek V4，失败后跨家族容灾至 GLM / Kimi"),
+    "deepseek-v4-pro": ("DeepSeek V4 Pro (0813)", "点名 OpenRouter deepseek-v4-pro-0813，失败后退回 V4 Flash"),
+    "glm": ("GLM 家族优先", "优先 GLM 5.3 / 5.3 Flash，失败后跨家族容灾"),
+    "kimi": ("Kimi 家族优先", "优先 Kimi K3，失败后跨家族容灾"),
+}
+
+def sync_codex_model_catalog() -> dict:
+    """把 exposed_models 写进 Codex 的本地 model catalog。
+
+    Codex 客户端的模型下拉框读取 config.toml 里 model_catalog_json 指向的静态文件，
+    而不是网关的 /v1/models，所以新增入口必须同步到这里才可见。
+    条目里的 base_instructions / model_messages 是 Codex 自带的巨型提示词模板，
+    这里以现有条目为模板整体继承，只替换 slug 与展示字段。
+    """
+    codex_home = os.path.expanduser("~/.codex")
+    conf_path = os.path.join(codex_home, "config.toml")
+    catalog_name = "cc-switch-model-catalog.json"
+    if os.path.exists(conf_path):
+        with open(conf_path, "r", encoding="utf-8") as f:
+            m = re.search(r'model_catalog_json\s*=\s*["\']([^"\']+)["\']', f.read())
+        if m:
+            catalog_name = m.group(1)
+
+    catalog_path = catalog_name if os.path.isabs(catalog_name) else os.path.join(codex_home, catalog_name)
+    if not os.path.exists(catalog_path):
+        return {"synced": False, "reason": f"未找到 model catalog: {catalog_path}"}
+
+    try:
+        with open(catalog_path, "r", encoding="utf-8") as f:
+            catalog = json.load(f)
+    except Exception as e:
+        return {"synced": False, "reason": f"解析 model catalog 失败: {e}"}
+
+    existing = catalog.get("models") or []
+    if not existing:
+        return {"synced": False, "reason": "model catalog 为空，缺少可继承的条目模板"}
+
+    by_slug = {m.get("slug"): m for m in existing if isinstance(m, dict)}
+    template = by_slug.get("auto") or existing[0]
+
+    exposed = state.codex_config.get("exposed_models") or ["auto", "deepseek", "deepseek-v4-pro", "glm", "kimi"]
+    new_models = []
+    for idx, slug in enumerate(exposed):
+        base = copy.deepcopy(by_slug.get(slug) or template)
+        label, desc = CODEX_MODEL_LABELS.get(slug, (slug, f"网关模型入口: {slug}"))
+        base["slug"] = slug
+        base["display_name"] = label
+        base["description"] = desc
+        base["priority"] = 2000 - idx * 100
+        base["visibility"] = "list"
+        base["supported_in_api"] = True
+        new_models.append(base)
+
+    shutil.copy2(catalog_path, f"{catalog_path}.bak")
+    catalog["models"] = new_models
+    with open(catalog_path, "w", encoding="utf-8") as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+
+    return {"synced": True, "path": catalog_path, "models": exposed}
+
 @app_harness.post("/api/tools/sync-codex-config")
 async def api_sync_codex_config():
     codex_conf_path = os.path.expanduser("~/.codex/config.toml")
@@ -1308,7 +1383,8 @@ wire_api = "responses"
         return {
             "status": "ok",
             "message": f"已自动创建 ~/.codex/config.toml 并设置 base_url 为 {target_url}",
-            "base_url": target_url
+            "base_url": target_url,
+            "catalog": sync_codex_model_catalog()
         }
     
     with open(codex_conf_path, "r", encoding="utf-8") as f:
@@ -1335,15 +1411,25 @@ wire_api = "responses"
     with open(codex_conf_path, "w", encoding="utf-8") as f:
         f.write(new_content)
     
+    catalog_result = sync_codex_model_catalog()
+    msg = f"~/.codex/config.toml 已成功同步至专用端口 {target_port} ({target_url})"
+    if catalog_result.get("synced"):
+        msg += f"；模型列表已同步 {len(catalog_result.get('models', []))} 项，重启 Codex 生效"
     return {
         "status": "ok",
-        "message": f"~/.codex/config.toml 已成功同步至专用端口 {target_port} ({target_url})",
-        "base_url": target_url
+        "message": msg,
+        "base_url": target_url,
+        "catalog": catalog_result
     }
 
 @app_harness.post("/api/providers/test")
 async def api_test_provider(req: TestKeyRequest):
     return await probe_provider(req.channel or "harness", req.name)
+
+# Google AI Studio 跨境直连单次响应实测在 6~32s 波动，12s 的旧超时会让它几乎必然失败。
+PROBE_TIMEOUT_SECONDS = 25.0
+# 候选逐个超时会线性放大总耗时，3 个即可覆盖各渠道的可用模型
+PROBE_MAX_CANDIDATES = 3
 
 async def probe_provider(channel: str, name: str) -> dict:
     target_cfg = state.get_config(channel or "harness")
@@ -1388,10 +1474,11 @@ async def probe_provider(channel: str, name: str) -> dict:
     if not candidate_models:
         candidate_models = ["gemini-3.5-flash", "meta/llama-3.2-11b-vision-instruct", "openrouter/free"]
 
-    start = time.time()
     last_err = ""
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        for test_model in candidate_models[:5]:
+    total_start = time.time()
+    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
+        for test_model in candidate_models[:PROBE_MAX_CANDIDATES]:
+            attempt_start = time.time()
             try:
                 resp = await client.post(
                     url,
@@ -1402,17 +1489,18 @@ async def probe_provider(channel: str, name: str) -> dict:
                         "max_tokens": 5
                     }
                 )
-                latency = int((time.time() - start) * 1000)
                 if resp.status_code == 200:
+                    # 只计本次成功往返：累计值会把前面候选的超时算进来，把一个 2s 的渠道报成 30s
+                    latency = int((time.time() - attempt_start) * 1000)
                     result = {"status": "ok", "latency_ms": latency, "model": test_model, "message": "测试通过"}
                     record_provider_health(channel, name, result)
                     return result
                 else:
                     last_err = f"[{test_model}] {resp.status_code}: {resp.text[:80]}"
             except Exception as e:
-                last_err = f"[{test_model}] {str(e)[:80]}"
+                last_err = f"[{test_model}] 超时或异常({int(time.time() - attempt_start)}s): {str(e)[:60]}"
 
-    latency = int((time.time() - start) * 1000)
+    latency = int((time.time() - total_start) * 1000)
     result = {"status": "error", "latency_ms": latency, "message": last_err}
     record_provider_health(channel, name, result)
     return result
@@ -1750,6 +1838,7 @@ async def fetch_and_update_latest_free_models() -> dict:
     state.config["exposed_models"] = [
         "auto",
         "deepseek",
+        "deepseek-v4-pro",
         "glm",
         "kimi"
     ]
@@ -1834,7 +1923,7 @@ async def list_models_codex():
 
 async def list_models(channel: str = "harness"):
     cfg = state.get_config(channel)
-    exposed = cfg.get("exposed_models", ["auto", "deepseek", "glm", "kimi"])
+    exposed = cfg.get("exposed_models", ["auto", "deepseek", "deepseek-v4-pro", "glm", "kimi"])
     data = [
         {
             "id": mid,

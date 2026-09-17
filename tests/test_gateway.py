@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 # 确保无论从何处运行均可正确导入 src/gateway
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
-from gateway import app, state, GatewayState
+from gateway import app, state, GatewayState, HARNESS_CONFIG_PATH, CODEX_CONFIG_PATH, CONFIG_PATH
 
 mock_app = FastAPI()
 mock_call_counts = {"primary": 0, "backup": 0}
@@ -83,6 +83,13 @@ async def run_tests():
     # 0. 备份原始配置，确保测试结束后 100% 还原，不污染 config.harness.yaml / config.codex.yaml
     original_harness = copy.deepcopy(state.harness_config)
     original_codex = copy.deepcopy(state.codex_config)
+    # Test 3/4 会真实落盘以验证持久化能力。只还原内存不够：finally 里的 reload_config()
+    # 会把被改写的磁盘内容重新读回来，真实渠道的 API Key 就此被测试值永久覆盖。
+    original_files = {}
+    for path in (HARNESS_CONFIG_PATH, CODEX_CONFIG_PATH, CONFIG_PATH):
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                original_files[path] = f.read()
 
     # 1. 启动 mock 上游服务器
     config = uvicorn.Config(mock_app, host="127.0.0.1", port=8999, log_level="warning")
@@ -147,7 +154,7 @@ async def run_tests():
         assert res.status_code == 200
         models_data = res.json()["data"]
         model_ids = [m["id"] for m in models_data]
-        assert model_ids == ["auto", "deepseek", "glm", "kimi"]
+        assert model_ids == ["auto", "deepseek", "deepseek-v4-pro", "glm", "kimi"]
         print(f"✅ 模型列表获取成功！包含模型数: {len(model_ids)}")
 
         # 四个入口是模型组而非单模型：显式组必须先耗尽同家族，再跨组容灾。
@@ -213,6 +220,24 @@ async def run_tests():
         ]
         assert any("v4-pro-0813" in model for model in ds_models), \
             f"OpenRouter 的 DeepSeek V4 Pro 未进入 deepseek 组: {ds_models[:8]}"
+
+        # 点名入口必须首选 Pro，不能被高优先级渠道的 flash 挤掉
+        pro_models = [
+            model
+            for tier in build_tiered_execution_plan("deepseek-v4-pro", has_tools=True, channel="harness")
+            for provider, model in tier["candidates"]
+            if not provider.get("name", "").startswith("Mock-")
+        ]
+        assert pro_models and "v4-pro-0813" in pro_models[0], \
+            f"deepseek-v4-pro 入口未首选 Pro: {pro_models[:5]}"
+
+        # 仪表盘日志流依赖 GET /api/logs，装饰器一旦丢失会静默 404、前端日志区永远空白
+        res = await client.get("/api/logs", params={"channel": "codex"})
+        assert res.status_code == 200, f"/api/logs 未注册: {res.status_code}"
+        assert isinstance(res.json(), list)
+        res = await client.get("/api/logs")
+        assert res.status_code == 200 and isinstance(res.json(), list)
+        print("✅ /api/logs 链路日志接口正常！")
 
         # Test 2: GET / 仪表盘
         print("\n[Test 2/6] 测试 GET / 交互式网页仪表盘...")
@@ -450,7 +475,13 @@ async def run_tests():
         await client.aclose()
         server.should_exit = True
         await mock_task
-        # 100% 还原原始内存与磁盘配置，避免 Mock 污染
+        # 100% 还原原始内存与磁盘配置，避免 Mock 与测试 Key 污染真实渠道
+        for path, content in original_files.items():
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                print(f"⚠️ 还原配置文件失败 {path}: {e}")
         state.harness_config = original_harness
         state.codex_config = original_codex
         state.reload_config()
