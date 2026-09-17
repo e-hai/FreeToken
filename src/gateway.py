@@ -1567,10 +1567,10 @@ def stream_peek_has_substance(peek_bytes: bytes) -> bool:
                     return True
                 delta = choice.get("delta", {})
                 content = delta.get("content")
-                if content and content.strip():
+                if content is not None and len(content) > 0:
                     return True
                 rc = delta.get("reasoning_content")
-                if rc and rc.strip():
+                if rc is not None and len(rc) > 0:
                     return True
                 if delta.get("tool_calls"):
                     return True
@@ -1757,16 +1757,16 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
             logger.info(f"🔄 [{tier_name}] 尝试渠道 [{p_name} (P:{provider.get('priority', 50)})] -> 真实模型 [{upstream_model}]...")
 
             try:
-                # 智能两阶段超时控制：
-                # 1. 阶段一（首包探针）：握手与响应头设置 25s 快速探针，遇挂死立即冷却 30s 并秒级故障转移
-                # 2. 阶段二（流式生成）：分块流式读取设置 180s 宽裕超时，保障超大上下文与长思考/工具调用永不被误熔断
-                p_read_timeout = 180.0 if is_stream else float(provider.get("timeout", 90.0))
-                client_timeout = httpx.Timeout(p_read_timeout, connect=15.0, read=p_read_timeout, write=60.0, pool=10.0)
+                # 智能两阶段与大上下文自适应超时控制：
+                # 1. 阶段一（连接与响应头）：设置 60s 宽裕超时，保障跨境大请求体（200+ 轮历史）网络握手不被误熔断
+                # 2. 阶段二（流式生成）：分块流式读取设置 300s 宽裕超时，保障超大上下文与深度思考/海量工具调用永不被误熔断
+                p_read_timeout = 300.0 if is_stream else float(provider.get("timeout", 120.0))
+                client_timeout = httpx.Timeout(p_read_timeout, connect=30.0, read=p_read_timeout, write=120.0, pool=30.0)
                 client = httpx.AsyncClient(timeout=client_timeout)
 
                 if is_stream:
                     req = client.build_request("POST", url, headers=headers, json=call_body)
-                    initial_header_timeout = 25.0
+                    initial_header_timeout = 60.0
                     try:
                         response = await asyncio.wait_for(client.send(req, stream=True), timeout=initial_header_timeout)
                     except Exception as header_err:
@@ -1798,14 +1798,16 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                         raise HTTPException(status_code=response.status_code, detail=f"[{p_name}] {error_str}")
 
                     # 🌟 首包深度探针：预读取流数据，必须嗅探到实质有效内容（非空文本、推理过程、工具调用或完结标识）
-                    # 彻底拦截假 200 实则卡死不吐字或仅返回空 assistant role 的假活流
+                    # 依据上下文规模智能自适应延长 TTFT 嗅探窗口，防止超长上下文 GPU 预填充耗时被误判为假死
                     stream_iter = response.aiter_bytes()
                     peek_chunks = []
                     has_substance = False
                     try:
-                        peek_timeout = float(provider.get("peek_timeout", 35.0))
+                        base_peek = float(provider.get("peek_timeout", 60.0))
+                        msgs_count = len(call_body.get("messages", []))
+                        peek_timeout = max(base_peek, 85.0) if msgs_count > 30 else base_peek
                         peek_deadline = time.time() + peek_timeout
-                        while time.time() < peek_deadline and len(peek_chunks) < 20:
+                        while time.time() < peek_deadline and len(peek_chunks) < 60:
                             remaining = max(0.5, peek_deadline - time.time())
                             chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=remaining)
                             peek_chunks.append(chunk)
@@ -1949,9 +1951,16 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                             }
 
                         try:
+                            iter_obj = combined_bytes_iter()
                             if not has_tools:
-                                async for chunk in combined_bytes_iter():
-                                    yield chunk
+                                while True:
+                                    try:
+                                        chunk = await asyncio.wait_for(iter_obj.__anext__(), timeout=5.0)
+                                        yield chunk
+                                    except asyncio.TimeoutError:
+                                        yield b": keepalive\n\n"
+                                    except StopAsyncIteration:
+                                        break
                             else:
                                 buffer = ""
 
@@ -2098,7 +2107,15 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                                     else:
                                         yield f"data: {json.dumps(chunk_json)}\n\n".encode("utf-8")
 
-                                async for chunk_bytes in combined_bytes_iter():
+                                while True:
+                                    try:
+                                        chunk_bytes = await asyncio.wait_for(iter_obj.__anext__(), timeout=5.0)
+                                    except asyncio.TimeoutError:
+                                        yield b": keepalive\n\n"
+                                        continue
+                                    except StopAsyncIteration:
+                                        break
+
                                     buffer += chunk_bytes.decode("utf-8", errors="replace")
                                     while "\n\n" in buffer:
                                         msg_raw, buffer = buffer.split("\n\n", 1)
@@ -2140,11 +2157,35 @@ async def chat_completions(request: Request, channel: Optional[str] = None):
                                     yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'tool_calls'))}\n\n".encode("utf-8")
                                 else:
                                     yield f"data: {json.dumps(build_content_chunk(last_chunk_id, invoke_buffer))}\n\n".encode("utf-8")
-                                    yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                    err_chunk = {
+                                        "id": last_chunk_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": requested_model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                                        "error": {
+                                            "message": f"Stream interrupted from [{p_name}]: {repr(e)}",
+                                            "type": "upstream_error",
+                                            "code": "stream_interrupted"
+                                        }
+                                    }
+                                    yield f"data: {json.dumps(err_chunk)}\n\n".encode("utf-8")
                                 invoke_buffer = ""
                                 in_invoke_mode = False
                             elif not native_tool_calls_seen:
-                                yield f"data: {json.dumps(build_finish_chunk(last_chunk_id, 'stop'))}\n\n".encode("utf-8")
+                                err_chunk = {
+                                    "id": last_chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": requested_model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                                    "error": {
+                                        "message": f"Stream interrupted from [{p_name}]: {repr(e)}",
+                                        "type": "upstream_error",
+                                        "code": "stream_interrupted"
+                                    }
+                                }
+                                yield f"data: {json.dumps(err_chunk)}\n\n".encode("utf-8")
                         finally:
                             try:
                                 await response.aclose()
@@ -2847,7 +2888,7 @@ async def handle_openai_responses(request: Request):
     # 1. 非流式处理 (stream: false)
     if not is_stream:
         transport = httpx.ASGITransport(app=app_codex)
-        async with httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=120.0) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=600.0) as client:
             res = await client.post("/v1/chat/completions", json=chat_payload, headers=headers)
         if res.status_code != 200:
             return JSONResponse(status_code=res.status_code, content=res.json())
@@ -2950,7 +2991,7 @@ async def handle_openai_responses(request: Request):
         yield f"event: response.created\ndata: {json.dumps(created_event)}\n\n"
 
         transport = httpx.ASGITransport(app=app_codex)
-        internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=240.0)
+        internal_client = httpx.AsyncClient(transport=transport, base_url="http://internal", timeout=600.0)
 
         # 候选重试链：优先请求模型，若因上游挂起断流未产出任何有效内容，则通过同一 SSE 连接秒级无缝接力备用旗舰
         candidate_models = [model]
@@ -2959,6 +3000,8 @@ async def handle_openai_responses(request: Request):
                 candidate_models.append(fb)
 
         upstream_res = None
+        stream_interrupted = False
+        stream_err_msg = ""
         try:
             for try_idx, curr_model in enumerate(candidate_models):
                 curr_payload = dict(chat_payload)
@@ -2981,7 +3024,16 @@ async def handle_openai_responses(request: Request):
                         upstream_res = None
                         continue
 
-                    async for line in upstream_res.aiter_lines():
+                    line_iter = upstream_res.aiter_lines()
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(line_iter.__anext__(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                            continue
+                        except StopAsyncIteration:
+                            break
+
                         line_str = line.strip()
                         if not line_str or line_str.startswith(":"):
                             continue
@@ -3119,6 +3171,8 @@ async def handle_openai_responses(request: Request):
                         tool_calls_map = {}
                 except Exception as loop_err:
                     logger.warning(f"⚠️ [Responses API Streaming] 尝试模型 [{curr_model}] 异常: {repr(loop_err)}")
+                    stream_interrupted = True
+                    stream_err_msg = str(loop_err)
                 finally:
                     if upstream_res:
                         try:
@@ -3126,6 +3180,27 @@ async def handle_openai_responses(request: Request):
                         except Exception:
                             pass
                         upstream_res = None
+
+            # 若在流式推送中途（已发送部分文本或工具调用后）遭遇底层网络或 upstream 异常断开，严禁误报 completed，必须按规范发射 response.failed
+            if stream_interrupted and (msg_started or tool_calls_map):
+                logger.error(f"❌ [Responses API Streaming] 模型在流式生成中途异常中断，发射 response.failed 事件通知客户端")
+                failed_event = {
+                    "type": "response.failed",
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "failed",
+                        "model": final_model,
+                        "created_at": created_at,
+                        "error": {
+                            "type": "server_error",
+                            "code": "stream_interrupted",
+                            "message": f"Upstream stream interrupted mid-flight: {stream_err_msg}"
+                        }
+                    }
+                }
+                yield f"event: response.failed\ndata: {json.dumps(failed_event)}\n\n"
+                return
 
             # 极端防中断保活：若所有候选均未产出有效内容，按照 OpenAI Responses API 完整规范依次发射 lifecycle 事件
             if not msg_started and not tool_calls_map:
@@ -3563,8 +3638,8 @@ async def run_servers():
     host_c = state.codex_config.get("server", {}).get("host", "127.0.0.1")
     port_c = int(state.codex_config.get("server", {}).get("port", 8001))
 
-    cfg_h = uvicorn.Config(app_harness, host=host_h, port=port_h, log_level="warning")
-    cfg_c = uvicorn.Config(app_codex, host=host_c, port=port_c, log_level="warning")
+    cfg_h = uvicorn.Config(app_harness, host=host_h, port=port_h, log_level="warning", timeout_keep_alive=120)
+    cfg_c = uvicorn.Config(app_codex, host=host_c, port=port_c, log_level="warning", timeout_keep_alive=120)
 
     server_h = uvicorn.Server(cfg_h)
     server_c = uvicorn.Server(cfg_c)
