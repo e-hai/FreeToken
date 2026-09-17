@@ -2796,8 +2796,8 @@ async def handle_openai_responses(request: Request):
                     if isinstance(c, list):
                         text_parts = []
                         for part in c:
-                            if isinstance(part, dict) and part.get("type") in ("input_text", "text", "output_text"):
-                                text_parts.append(part.get("text", ""))
+                            if isinstance(part, dict) and part.get("type") in ("input_text", "text", "output_text", "reasoning", "thought"):
+                                text_parts.append(part.get("text", "") or part.get("reasoning", ""))
                             elif isinstance(part, str):
                                 text_parts.append(part)
                         c = "\n".join(text_parts) if text_parts else ""
@@ -2898,6 +2898,11 @@ async def handle_openai_responses(request: Request):
         choice = chat_data.get("choices", [{}])[0]
         message = choice.get("message", {})
         content_text = message.get("content")
+        reasoning_text = message.get("reasoning_content")
+        if not content_text and reasoning_text:
+            content_text = reasoning_text
+        elif content_text and reasoning_text:
+            content_text = f"{reasoning_text}\n\n{content_text}"
         tool_calls = message.get("tool_calls", [])
 
         output_items = []
@@ -3056,8 +3061,10 @@ async def handle_openai_responses(request: Request):
                             continue
                         delta = choices[0].get("delta", {})
 
-                        # 文本增量推流
-                        text_chunk = delta.get("content")
+                        # 文本增量推流 (兼容 content 与 reasoning_content)
+                        raw_content = delta.get("content") or ""
+                        raw_reasoning = delta.get("reasoning_content") or ""
+                        text_chunk = (raw_reasoning + raw_content) if (raw_content and raw_reasoning) else (raw_content or raw_reasoning)
                         if text_chunk:
                             if not msg_started:
                                 pending_leading_ws += text_chunk
