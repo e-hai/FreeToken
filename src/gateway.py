@@ -1459,7 +1459,7 @@ async def probe_provider(channel: str, name: str) -> dict:
         headers["X-Title"] = "DeepSeek-Harness"
 
     preferred_probes = {
-        "Google AI Studio": ["gemini-3.5-flash", "gemini-flash-latest"],
+        "Google AI Studio": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-lite-latest", "gemini-3.5-flash-lite"],
         "Groq Cloud": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
         "NVIDIA NIM": ["meta/llama-3.2-11b-vision-instruct", "nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v4-flash-0731"],
         "OpenRouter (Global)": ["cohere/north-mini-code:free", "thinkingmachines/inkling-small:free", "openrouter/free"]
